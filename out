@@ -1,0 +1,451 @@
+/// The superclass of objects that can reside on V8's heap.
+[repr(C)]
+pub struct Data(Opaque);
+
+/// An AccessorSignature specifies which receivers are valid parameters to an
+/// accessor callback.
+[repr(C)]
+pub struct AccessorSignature(Opaque);
+impl HasBase for AccessorSignature { type Base = Data; }
+impl HasAncestor<Data> for AccessorSignature { }
+
+/// A compiled JavaScript module.
+[repr(C)]
+pub struct Module(Opaque);
+impl HasBase for Module { type Base = Data; }
+impl HasAncestor<Data> for Module { }
+
+/// A private symbol
+[repr(C)]
+pub struct Private(Opaque);
+impl HasBase for Private { type Base = Data; }
+impl HasAncestor<Data> for Private { }
+
+/// A Signature specifies which receiver is valid for a function.
+[repr(C)]
+pub struct Signature(Opaque);
+impl HasBase for Signature { type Base = Data; }
+impl HasAncestor<Data> for Signature { }
+
+/// The superclass of object and function templates.
+[repr(C)]
+pub struct Template(Opaque);
+impl HasBase for Template { type Base = Data; }
+impl HasAncestor<Data> for Template { }
+
+/// A FunctionTemplate is used to create functions at runtime. There can only
+/// be one function created from a FunctionTemplate in a context. The lifetime
+/// of the created function is equal to the lifetime of the context. So in case
+/// the embedder needs to create temporary functions that can be collected
+/// using Scripts is preferred.
+[repr(C)]
+pub struct FunctionTemplate(Opaque);
+impl HasBase for FunctionTemplate { type Base = Template; }
+impl HasAncestor<Data> for FunctionTemplate { }
+impl HasAncestor<Template> for FunctionTemplate { }
+
+/// An ObjectTemplate is used to create objects at runtime.
+[repr(C)]
+pub struct ObjectTemplate(Opaque);
+impl HasBase for ObjectTemplate { type Base = Template; }
+impl HasAncestor<Data> for ObjectTemplate { }
+impl HasAncestor<Template> for ObjectTemplate { }
+
+/// A compiled JavaScript module, not yet tied to a Context.
+[repr(C)]
+pub struct UnboundModuleScript(Opaque);
+impl HasBase for UnboundModuleScript { type Base = Data; }
+impl HasAncestor<Data> for UnboundModuleScript { }
+
+/// The superclass of all JavaScript values and objects.
+[repr(C)]
+pub struct Value(Opaque);
+impl HasBase for Value { type Base = Data; }
+impl HasAncestor<Data> for Value { }
+
+/// A JavaScript value that wraps a C++ void*. This type of value is mainly
+/// used to associate C++ data structures with JavaScript objects.
+[repr(C)]
+pub struct External(Opaque);
+impl HasBase for External { type Base = Value; }
+impl HasAncestor<Data> for External { }
+impl HasAncestor<Value> for External { }
+
+/// A JavaScript object (ECMA-262, 4.3.3)
+[repr(C)]
+pub struct Object(Opaque);
+impl HasBase for Object { type Base = Value; }
+impl HasAncestor<Data> for Object { }
+impl HasAncestor<Value> for Object { }
+
+/// An instance of the built-in array constructor (ECMA-262, 15.4.2).
+[repr(C)]
+pub struct Array(Opaque);
+impl HasBase for Array { type Base = Object; }
+impl HasAncestor<Data> for Array { }
+impl HasAncestor<Value> for Array { }
+impl HasAncestor<Object> for Array { }
+
+/// An instance of the built-in ArrayBuffer constructor (ES6 draft 15.13.5).
+[repr(C)]
+pub struct ArrayBuffer(Opaque);
+impl HasBase for ArrayBuffer { type Base = Object; }
+impl HasAncestor<Data> for ArrayBuffer { }
+impl HasAncestor<Value> for ArrayBuffer { }
+impl HasAncestor<Object> for ArrayBuffer { }
+
+/// A base class for an instance of one of "views" over ArrayBuffer, including
+/// TypedArrays and DataView (ES6 draft 15.13).
+[repr(C)]
+pub struct ArrayBufferView(Opaque);
+impl HasBase for ArrayBufferView { type Base = Object; }
+impl HasAncestor<Data> for ArrayBufferView { }
+impl HasAncestor<Value> for ArrayBufferView { }
+impl HasAncestor<Object> for ArrayBufferView { }
+
+/// An instance of DataView constructor (ES6 draft 15.13.7).
+[repr(C)]
+pub struct DataView(Opaque);
+impl HasBase for DataView { type Base = ArrayBufferView; }
+impl HasAncestor<Data> for DataView { }
+impl HasAncestor<Value> for DataView { }
+impl HasAncestor<Object> for DataView { }
+impl HasAncestor<ArrayBufferView> for DataView { }
+
+/// A base class for an instance of TypedArray series of constructors (ES6
+/// draft 15.13.6).
+[repr(C)]
+pub struct TypedArray(Opaque);
+impl HasBase for TypedArray { type Base = ArrayBufferView; }
+impl HasAncestor<Data> for TypedArray { }
+impl HasAncestor<Value> for TypedArray { }
+impl HasAncestor<Object> for TypedArray { }
+impl HasAncestor<ArrayBufferView> for TypedArray { }
+
+/// An instance of BigInt64Array constructor.
+[repr(C)]
+pub struct BigInt64Array(Opaque);
+impl HasBase for BigInt64Array { type Base = TypedArray; }
+impl HasAncestor<Data> for BigInt64Array { }
+impl HasAncestor<Value> for BigInt64Array { }
+impl HasAncestor<Object> for BigInt64Array { }
+impl HasAncestor<ArrayBufferView> for BigInt64Array { }
+impl HasAncestor<TypedArray> for BigInt64Array { }
+
+/// An instance of BigUint64Array constructor.
+[repr(C)]
+pub struct BigUint64Array(Opaque);
+impl HasBase for BigUint64Array { type Base = TypedArray; }
+impl HasAncestor<Data> for BigUint64Array { }
+impl HasAncestor<Value> for BigUint64Array { }
+impl HasAncestor<Object> for BigUint64Array { }
+impl HasAncestor<ArrayBufferView> for BigUint64Array { }
+impl HasAncestor<TypedArray> for BigUint64Array { }
+
+/// An instance of Float32Array constructor (ES6 draft 15.13.6).
+[repr(C)]
+pub struct Float32Array(Opaque);
+impl HasBase for Float32Array { type Base = TypedArray; }
+impl HasAncestor<Data> for Float32Array { }
+impl HasAncestor<Value> for Float32Array { }
+impl HasAncestor<Object> for Float32Array { }
+impl HasAncestor<ArrayBufferView> for Float32Array { }
+impl HasAncestor<TypedArray> for Float32Array { }
+
+/// An instance of Float64Array constructor (ES6 draft 15.13.6).
+[repr(C)]
+pub struct Float64Array(Opaque);
+impl HasBase for Float64Array { type Base = TypedArray; }
+impl HasAncestor<Data> for Float64Array { }
+impl HasAncestor<Value> for Float64Array { }
+impl HasAncestor<Object> for Float64Array { }
+impl HasAncestor<ArrayBufferView> for Float64Array { }
+impl HasAncestor<TypedArray> for Float64Array { }
+
+/// An instance of Int16Array constructor (ES6 draft 15.13.6).
+[repr(C)]
+pub struct Int16Array(Opaque);
+impl HasBase for Int16Array { type Base = TypedArray; }
+impl HasAncestor<Data> for Int16Array { }
+impl HasAncestor<Value> for Int16Array { }
+impl HasAncestor<Object> for Int16Array { }
+impl HasAncestor<ArrayBufferView> for Int16Array { }
+impl HasAncestor<TypedArray> for Int16Array { }
+
+/// An instance of Int32Array constructor (ES6 draft 15.13.6).
+[repr(C)]
+pub struct Int32Array(Opaque);
+impl HasBase for Int32Array { type Base = TypedArray; }
+impl HasAncestor<Data> for Int32Array { }
+impl HasAncestor<Value> for Int32Array { }
+impl HasAncestor<Object> for Int32Array { }
+impl HasAncestor<ArrayBufferView> for Int32Array { }
+impl HasAncestor<TypedArray> for Int32Array { }
+
+/// An instance of Int8Array constructor (ES6 draft 15.13.6).
+[repr(C)]
+pub struct Int8Array(Opaque);
+impl HasBase for Int8Array { type Base = TypedArray; }
+impl HasAncestor<Data> for Int8Array { }
+impl HasAncestor<Value> for Int8Array { }
+impl HasAncestor<Object> for Int8Array { }
+impl HasAncestor<ArrayBufferView> for Int8Array { }
+impl HasAncestor<TypedArray> for Int8Array { }
+
+/// An instance of Uint16Array constructor (ES6 draft 15.13.6).
+[repr(C)]
+pub struct Uint16Array(Opaque);
+impl HasBase for Uint16Array { type Base = TypedArray; }
+impl HasAncestor<Data> for Uint16Array { }
+impl HasAncestor<Value> for Uint16Array { }
+impl HasAncestor<Object> for Uint16Array { }
+impl HasAncestor<ArrayBufferView> for Uint16Array { }
+impl HasAncestor<TypedArray> for Uint16Array { }
+
+/// An instance of Uint32Array constructor (ES6 draft 15.13.6).
+[repr(C)]
+pub struct Uint32Array(Opaque);
+impl HasBase for Uint32Array { type Base = TypedArray; }
+impl HasAncestor<Data> for Uint32Array { }
+impl HasAncestor<Value> for Uint32Array { }
+impl HasAncestor<Object> for Uint32Array { }
+impl HasAncestor<ArrayBufferView> for Uint32Array { }
+impl HasAncestor<TypedArray> for Uint32Array { }
+
+/// An instance of Uint8Array constructor (ES6 draft 15.13.6).
+[repr(C)]
+pub struct Uint8Array(Opaque);
+impl HasBase for Uint8Array { type Base = TypedArray; }
+impl HasAncestor<Data> for Uint8Array { }
+impl HasAncestor<Value> for Uint8Array { }
+impl HasAncestor<Object> for Uint8Array { }
+impl HasAncestor<ArrayBufferView> for Uint8Array { }
+impl HasAncestor<TypedArray> for Uint8Array { }
+
+/// An instance of Uint8ClampedArray constructor (ES6 draft 15.13.6).
+[repr(C)]
+pub struct Uint8ClampedArray(Opaque);
+impl HasBase for Uint8ClampedArray { type Base = TypedArray; }
+impl HasAncestor<Data> for Uint8ClampedArray { }
+impl HasAncestor<Value> for Uint8ClampedArray { }
+impl HasAncestor<Object> for Uint8ClampedArray { }
+impl HasAncestor<ArrayBufferView> for Uint8ClampedArray { }
+impl HasAncestor<TypedArray> for Uint8ClampedArray { }
+
+/// A BigInt object (https://tc39.github.io/proposal-bigint)
+[repr(C)]
+pub struct BigIntObject(Opaque);
+impl HasBase for BigIntObject { type Base = Object; }
+impl HasAncestor<Data> for BigIntObject { }
+impl HasAncestor<Value> for BigIntObject { }
+impl HasAncestor<Object> for BigIntObject { }
+
+/// A Boolean object (ECMA-262, 4.3.15).
+[repr(C)]
+pub struct BooleanObject(Opaque);
+impl HasBase for BooleanObject { type Base = Object; }
+impl HasAncestor<Data> for BooleanObject { }
+impl HasAncestor<Value> for BooleanObject { }
+impl HasAncestor<Object> for BooleanObject { }
+
+/// An instance of the built-in Date constructor (ECMA-262, 15.9).
+[repr(C)]
+pub struct Date(Opaque);
+impl HasBase for Date { type Base = Object; }
+impl HasAncestor<Data> for Date { }
+impl HasAncestor<Value> for Date { }
+impl HasAncestor<Object> for Date { }
+
+/// An instance of the built-in FinalizationGroup constructor.
+[repr(C)]
+pub struct FinalizationGroup(Opaque);
+impl HasBase for FinalizationGroup { type Base = Object; }
+impl HasAncestor<Data> for FinalizationGroup { }
+impl HasAncestor<Value> for FinalizationGroup { }
+impl HasAncestor<Object> for FinalizationGroup { }
+
+/// A JavaScript function object (ECMA-262, 15.3).
+[repr(C)]
+pub struct Function(Opaque);
+impl HasBase for Function { type Base = Object; }
+impl HasAncestor<Data> for Function { }
+impl HasAncestor<Value> for Function { }
+impl HasAncestor<Object> for Function { }
+
+/// An instance of the built-in Map constructor (ECMA-262, 6th Edition,
+/// 23.1.1).
+[repr(C)]
+pub struct Map(Opaque);
+impl HasBase for Map { type Base = Object; }
+impl HasAncestor<Data> for Map { }
+impl HasAncestor<Value> for Map { }
+impl HasAncestor<Object> for Map { }
+
+/// A Number object (ECMA-262, 4.3.21).
+[repr(C)]
+pub struct NumberObject(Opaque);
+impl HasBase for NumberObject { type Base = Object; }
+impl HasAncestor<Data> for NumberObject { }
+impl HasAncestor<Value> for NumberObject { }
+impl HasAncestor<Object> for NumberObject { }
+
+/// An instance of the built-in Promise constructor (ES6 draft).
+[repr(C)]
+pub struct Promise(Opaque);
+impl HasBase for Promise { type Base = Object; }
+impl HasAncestor<Data> for Promise { }
+impl HasAncestor<Value> for Promise { }
+impl HasAncestor<Object> for Promise { }
+
+/// An instance of the built-in Proxy constructor (ECMA-262, 6th Edition,
+/// 26.2.1).
+[repr(C)]
+pub struct Proxy(Opaque);
+impl HasBase for Proxy { type Base = Object; }
+impl HasAncestor<Data> for Proxy { }
+impl HasAncestor<Value> for Proxy { }
+impl HasAncestor<Object> for Proxy { }
+
+/// An instance of the built-in RegExp constructor (ECMA-262, 15.10).
+[repr(C)]
+pub struct RegExp(Opaque);
+impl HasBase for RegExp { type Base = Object; }
+impl HasAncestor<Data> for RegExp { }
+impl HasAncestor<Value> for RegExp { }
+impl HasAncestor<Object> for RegExp { }
+
+[repr(C)]
+pub struct Resolver(Opaque);
+impl HasBase for Resolver { type Base = Object; }
+impl HasAncestor<Data> for Resolver { }
+impl HasAncestor<Value> for Resolver { }
+impl HasAncestor<Object> for Resolver { }
+
+/// An instance of the built-in Set constructor (ECMA-262, 6th Edition,
+/// 23.2.1).
+[repr(C)]
+pub struct Set(Opaque);
+impl HasBase for Set { type Base = Object; }
+impl HasAncestor<Data> for Set { }
+impl HasAncestor<Value> for Set { }
+impl HasAncestor<Object> for Set { }
+
+/// An instance of the built-in SharedArrayBuffer constructor. This API is
+/// experimental and may change significantly.
+[repr(C)]
+pub struct SharedArrayBuffer(Opaque);
+impl HasBase for SharedArrayBuffer { type Base = Object; }
+impl HasAncestor<Data> for SharedArrayBuffer { }
+impl HasAncestor<Value> for SharedArrayBuffer { }
+impl HasAncestor<Object> for SharedArrayBuffer { }
+
+/// A String object (ECMA-262, 4.3.18).
+[repr(C)]
+pub struct StringObject(Opaque);
+impl HasBase for StringObject { type Base = Object; }
+impl HasAncestor<Data> for StringObject { }
+impl HasAncestor<Value> for StringObject { }
+impl HasAncestor<Object> for StringObject { }
+
+/// A Symbol object (ECMA-262 edition 6).
+[repr(C)]
+pub struct SymbolObject(Opaque);
+impl HasBase for SymbolObject { type Base = Object; }
+impl HasAncestor<Data> for SymbolObject { }
+impl HasAncestor<Value> for SymbolObject { }
+impl HasAncestor<Object> for SymbolObject { }
+
+[repr(C)]
+pub struct WasmModuleObject(Opaque);
+impl HasBase for WasmModuleObject { type Base = Object; }
+impl HasAncestor<Data> for WasmModuleObject { }
+impl HasAncestor<Value> for WasmModuleObject { }
+impl HasAncestor<Object> for WasmModuleObject { }
+
+/// The superclass of primitive values. See ECMA-262 4.3.2.
+[repr(C)]
+pub struct Primitive(Opaque);
+impl HasBase for Primitive { type Base = Value; }
+impl HasAncestor<Data> for Primitive { }
+impl HasAncestor<Value> for Primitive { }
+
+/// A JavaScript BigInt value (https://tc39.github.io/proposal-bigint)
+[repr(C)]
+pub struct BigInt(Opaque);
+impl HasBase for BigInt { type Base = Primitive; }
+impl HasAncestor<Data> for BigInt { }
+impl HasAncestor<Value> for BigInt { }
+impl HasAncestor<Primitive> for BigInt { }
+
+/// A primitive boolean value (ECMA-262, 4.3.14). Either the true or false
+/// value.
+[repr(C)]
+pub struct Boolean(Opaque);
+impl HasBase for Boolean { type Base = Primitive; }
+impl HasAncestor<Data> for Boolean { }
+impl HasAncestor<Value> for Boolean { }
+impl HasAncestor<Primitive> for Boolean { }
+
+/// A superclass for symbols and strings.
+[repr(C)]
+pub struct Name(Opaque);
+impl HasBase for Name { type Base = Primitive; }
+impl HasAncestor<Data> for Name { }
+impl HasAncestor<Value> for Name { }
+impl HasAncestor<Primitive> for Name { }
+
+/// A JavaScript string value (ECMA-262, 4.3.17).
+[repr(C)]
+pub struct String(Opaque);
+impl HasBase for String { type Base = Name; }
+impl HasAncestor<Data> for String { }
+impl HasAncestor<Value> for String { }
+impl HasAncestor<Primitive> for String { }
+impl HasAncestor<Name> for String { }
+
+/// A JavaScript symbol (ECMA-262 edition 6)
+[repr(C)]
+pub struct Symbol(Opaque);
+impl HasBase for Symbol { type Base = Name; }
+impl HasAncestor<Data> for Symbol { }
+impl HasAncestor<Value> for Symbol { }
+impl HasAncestor<Primitive> for Symbol { }
+impl HasAncestor<Name> for Symbol { }
+
+/// A JavaScript number value (ECMA-262, 4.3.20)
+[repr(C)]
+pub struct Number(Opaque);
+impl HasBase for Number { type Base = Primitive; }
+impl HasAncestor<Data> for Number { }
+impl HasAncestor<Value> for Number { }
+impl HasAncestor<Primitive> for Number { }
+
+/// A JavaScript value representing a signed integer.
+[repr(C)]
+pub struct Integer(Opaque);
+impl HasBase for Integer { type Base = Number; }
+impl HasAncestor<Data> for Integer { }
+impl HasAncestor<Value> for Integer { }
+impl HasAncestor<Primitive> for Integer { }
+impl HasAncestor<Number> for Integer { }
+
+/// A JavaScript value representing a 32-bit signed integer.
+[repr(C)]
+pub struct Int32(Opaque);
+impl HasBase for Int32 { type Base = Integer; }
+impl HasAncestor<Data> for Int32 { }
+impl HasAncestor<Value> for Int32 { }
+impl HasAncestor<Primitive> for Int32 { }
+impl HasAncestor<Number> for Int32 { }
+impl HasAncestor<Integer> for Int32 { }
+
+/// A JavaScript value representing a 32-bit unsigned integer.
+[repr(C)]
+pub struct Uint32(Opaque);
+impl HasBase for Uint32 { type Base = Integer; }
+impl HasAncestor<Data> for Uint32 { }
+impl HasAncestor<Value> for Uint32 { }
+impl HasAncestor<Primitive> for Uint32 { }
+impl HasAncestor<Number> for Uint32 { }
+impl HasAncestor<Integer> for Uint32 { }
+
