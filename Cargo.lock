@@ -29,7 +29,7 @@ version = "0.2.66"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 
 [[package]]
-name = "test17"
+name = "rusty_gen"
 version = "0.1.0"
 dependencies = [
  "clang 0.23.0 (registry+https://github.com/rust-lang/crates.io-index)",

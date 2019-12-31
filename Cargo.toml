@@ -1,5 +1,5 @@
 [package]
-name = "test17"
+name = "rusty_gen"
 version = "0.1.0"
 authors = ["Bert Belder <bertbelder@gmail.com>"]
 edition = "2018"
