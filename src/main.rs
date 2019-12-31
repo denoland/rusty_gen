@@ -110,12 +110,14 @@ fn main() {
 }
 
 fn boilerplate() -> &'static str {
-  r"
+  r"// Copyright 2018-2019 the Deno authors. All rights reserved. MIT license.
+
 use std::convert::From;
 use std::mem::transmute;
+use std::ops::Deref;
 
-use crate::Local;
 use crate::support::Opaque;
+use crate::Local;
 "
   /*
   "
@@ -180,7 +182,12 @@ fn visit_ancestors(def: &mut Def, a: Entity) -> Option<()> {
     visit_ancestors(def, b)?;
   }
   def.add_line(format!(
-    "impl<'sc> From<Local<'sc, {}>> for Local<'sc, {}> {{ fn from(l: Local<'sc, {}>) -> Self {{ unsafe {{ transmute(l) }} }} }}",
+    r"
+impl<'sc> From<Local<'sc, {}>> for Local<'sc, {}> {{
+  fn from(l: Local<'sc, {}>) -> Self {{
+    unsafe {{ transmute(l) }}
+  }}
+}}",
     get_name(e)?,
     get_name(a)?,
     get_name(e)?
@@ -194,7 +201,7 @@ fn visit_ancestors(def: &mut Def, a: Entity) -> Option<()> {
   Some(())
 }
 
-fn wrap_comment(comment: String) -> Vec<String> {
+fn wrap_comment_line(comment: String) -> Vec<String> {
   let mut lines = Vec::<String>::new();
   for part in comment.split_ascii_whitespace() {
     match lines.last_mut() {
@@ -210,36 +217,39 @@ fn wrap_comment(comment: String) -> Vec<String> {
   lines
 }
 
+fn format_comment(comment: String) -> String {
+  comment
+    .replace("\n * ", "\n/// ")
+    .replace("\n *\n", "\n///\n")
+    .trim_start_matches("/**")
+    .trim_start()
+    .trim_end_matches("*/")
+    .trim_end()
+    .to_owned()
+    .replace("\\code", "```ignore")
+    .replace("\\endcode", "```")
+    .replace(".  ", ". ")
+}
+
 fn visit_data_or_subclass(def: &mut Def) -> Option<()> {
   let e = def.entity();
   if let Some(comment) = e.get_comment() {
-    let comment = comment
-      .replace("\n * ", "\n/// ")
-      .replace("\n *\n", "\n///\n");
-    let comment = comment
-      .trim_start_matches("/**")
-      .trim_start()
-      .trim_end_matches("*/")
-      .trim_end()
-      .to_owned();
-    let comment = comment
-      .replace("\\code", "```ignore")
-      .replace("\\endcode", "```");
-
-    //;
-    //for l in wrap_comment(comment) {
-    //  def.add_line(l);
-    //}
-    def.add_line(comment);
+    def.add_line(format_comment(comment));
   }
   def.add_line("#[repr(C)]".to_owned());
   def.add_line(format!("pub struct {}(Opaque);", get_name(e)?));
   if let Some(b) = get_base_class(e) {
-    //def.add_line(format!(
-    //  "impl HasBase for {} {{ type Base = {}; }}",
-    //  get_name(e)?,
-    //  get_name(b)?
-    //));
+    def.add_line(format!(
+      r"
+impl Deref for {} {{
+  type Target = {};
+  fn deref(&self) -> &Self::Target {{
+    unsafe {{ &*(self as *const _ as *const Self::Target) }}
+  }}
+}}",
+      get_name(e)?,
+      get_name(b)?
+    ));
     visit_ancestors(def, b)?;
   }
   def.add_key(get_name(e)?);
