@@ -66,14 +66,9 @@ impl<'tu> Display for Def<'tu> {
 fn main() {
   let base_path = Path::new("/v8rs");
 
-  // Acquire an instance of `Clang`
   let clang = Clang::new().unwrap();
-
-  // Create a new `Index`
   let index = Index::new(&clang, false, false);
 
-  //-nostdinc++ -isystem./buildtools/third_party/libc++/trunk/include -isystem./buildtools/third_party/libc++abi/trunk/include
-  // Parse a source file into a translation unit
   #[allow(clippy::useless_format)]
   let arg = |s| format!("{}", s);
   let isystem =
@@ -118,16 +113,28 @@ use std::ops::Deref;
 
 use crate::support::Opaque;
 use crate::Local;
-"
-  /*
-  "
-  pub trait HasBase {
-    type Base;
-  }
 
-  pub trait HasAncestor<A> {}
-  "
-  */
+macro_rules! impl_deref {
+  { $a:ident for $b:ident } => {
+    impl Deref for $a {
+      type Target = $b;
+      fn deref(&self) -> &Self::Target {
+        unsafe { &*(self as *const _ as *const Self::Target) }
+      }
+    }
+  };
+}
+
+macro_rules! impl_local_from {
+  { $a:ident for $b:ident } => {
+    impl<'sc> From<Local<'sc, $a>> for Local<'sc, $b> {
+      fn from(l: Local<'sc, $a>) -> Self {
+        unsafe { transmute(l) }
+      }
+    }
+  };
+}
+"
 }
 
 fn get_base_class(e: Entity) -> Option<Entity> {
@@ -155,7 +162,9 @@ fn is_data_class(e: Entity) -> bool {
     && e.get_semantic_parent().map(is_v8_ns).unwrap_or(false)
 }
 
-fn get_name(e: Entity) -> Option<String> {
+// Returns the name of an entity for use in a flat namespace.
+// E.g. "v8::Promise::Resolver" -> "PromiseResolver".
+fn get_flat_name(e: Entity) -> Option<String> {
   let mut name = e.get_name()?;
   let mut p = e;
   loop {
@@ -182,22 +191,11 @@ fn visit_ancestors(def: &mut Def, a: Entity) -> Option<()> {
     visit_ancestors(def, b)?;
   }
   def.add_line(format!(
-    r"
-impl<'sc> From<Local<'sc, {}>> for Local<'sc, {}> {{
-  fn from(l: Local<'sc, {}>) -> Self {{
-    unsafe {{ transmute(l) }}
-  }}
-}}",
-    get_name(e)?,
-    get_name(a)?,
-    get_name(e)?
+    "impl_local_from! {{ {} for {} }}",
+    get_flat_name(e)?,
+    get_flat_name(a)?,
   ));
-  //def.add_line(format!(
-  //  "impl HasAncestor<{}> for {} {{ }}",
-  //  get_name(a)?,
-  //  get_name(e)?
-  //));
-  def.add_key(get_name(a)?);
+  def.add_key(get_flat_name(a)?);
   Some(())
 }
 
@@ -237,22 +235,16 @@ fn visit_data_or_subclass(def: &mut Def) -> Option<()> {
     def.add_line(format_comment(comment));
   }
   def.add_line("#[repr(C)]".to_owned());
-  def.add_line(format!("pub struct {}(Opaque);", get_name(e)?));
+  def.add_line(format!("pub struct {}(Opaque);", get_flat_name(e)?));
   if let Some(b) = get_base_class(e) {
     def.add_line(format!(
-      r"
-impl Deref for {} {{
-  type Target = {};
-  fn deref(&self) -> &Self::Target {{
-    unsafe {{ &*(self as *const _ as *const Self::Target) }}
-  }}
-}}",
-      get_name(e)?,
-      get_name(b)?
+      "impl_deref! {{ {} for {} }}",
+      get_flat_name(e)?,
+      get_flat_name(b)?
     ));
     visit_ancestors(def, b)?;
   }
-  def.add_key(get_name(e)?);
+  def.add_key(get_flat_name(e)?);
   Some(())
 }
 
