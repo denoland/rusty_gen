@@ -246,17 +246,7 @@ fn get_try_from_test_method<'tu>(
 
 fn to_snake_case(s: impl AsRef<str>) -> String {
   let mut words = vec![];
-  // Preserve leading underscores
-  let s = s.as_ref();
-  let s = s.trim_start_matches(|c: char| {
-    if c == '_' {
-      words.push(String::new());
-      true
-    } else {
-      false
-    }
-  });
-  for part in s.split('_') {
+  for part in s.as_ref().split('_') {
     let mut last_upper = false;
     let mut buf = String::new();
     if part.is_empty() {
@@ -332,22 +322,6 @@ fn add_local_try_from_impls(def: &mut Def, a: Entity) -> Option<()> {
     add_local_try_from_impls(def, b)?;
   }
   Some(())
-}
-
-fn wrap_comment_line(comment: String) -> Vec<String> {
-  let mut lines = Vec::<String>::new();
-  for part in comment.split_ascii_whitespace() {
-    match lines.last_mut() {
-      Some(l) if l.len() + 1 + part.len() < 80 => {
-        l.push(' ');
-        l.push_str(part);
-      }
-      _ => {
-        lines.push(format!("/// {}", part));
-      }
-    }
-  }
-  lines
 }
 
 fn format_comment(comment: String) -> String {
