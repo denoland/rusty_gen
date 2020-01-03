@@ -116,9 +116,9 @@ use crate::support::Opaque;
 use crate::Local;
 
 macro_rules! impl_deref {
-  { $a:ident for $b:ident } => {
-    impl Deref for $a {
-      type Target = $b;
+  { $target:ident for $type:ident } => {
+    impl Deref for $type {
+      type Target = $target;
       fn deref(&self) -> &Self::Target {
         unsafe { &*(self as *const _ as *const Self::Target) }
       }
@@ -127,9 +127,9 @@ macro_rules! impl_deref {
 }
 
 macro_rules! impl_from {
-  { $a:ident for $b:ident } => {
-    impl<'sc> From<Local<'sc, $a>> for Local<'sc, $b> {
-      fn from(l: Local<'sc, $a>) -> Self {
+  { $source:ident for $type:ident } => {
+    impl<'sc> From<Local<'sc, $source>> for Local<'sc, $type> {
+      fn from(l: Local<'sc, $source>) -> Self {
         unsafe { transmute(l) }
       }
     }
@@ -140,12 +140,12 @@ macro_rules! impl_from {
 pub struct TryFromTypeError;
 
 macro_rules! impl_try_from {
-  { $a:ident for $b:ident if $p:pat => $c:expr } => {
-    impl<'sc> TryFrom<Local<'sc, $a>> for Local<'sc, $b> {
+  { $source:ident for $target:ident if $value:pat => $check:expr } => {
+    impl<'sc> TryFrom<Local<'sc, $source>> for Local<'sc, $target> {
       type Error = TryFromTypeError;
-      fn try_from(l: Local<'sc, $a>) -> Result<Self, Self::Error> {
+      fn try_from(l: Local<'sc, $source>) -> Result<Self, Self::Error> {
         match l {
-          $p if $c => Ok(unsafe { transmute(l) }),
+          $value if $check => Ok(unsafe { transmute(l) }),
           _ => Err(TryFromTypeError)
         }
       }
@@ -275,7 +275,7 @@ fn to_snake_case(s: impl AsRef<str>) -> String {
   words.join("_")
 }
 
-fn get_try_from_condition<'tu>(
+fn get_try_from_check<'tu>(
   e: Entity<'tu>, // Target class, e.g. Boolean.
   b: Entity<'tu>, // Base class, e.g. Primitive.
 ) -> Option<String> {
@@ -289,11 +289,11 @@ fn get_try_from_condition<'tu>(
           "Primitive" => Some("v.is_null_or_undefined()".to_owned()),
           _ => None,
         },
-        |condition, s| {
+        |check, s| {
           Some(Some(format!(
             "{}{}",
-            condition.map(|s| format!("{} || ", s)).unwrap_or_default(),
-            get_try_from_condition(s, b)?
+            check.map(|s| format!("{} || ", s)).unwrap_or_default(),
+            get_try_from_check(s, b)?
           )))
         },
       )?
@@ -326,7 +326,7 @@ fn add_local_try_from_impls(def: &mut Def, a: Entity) -> Option<()> {
     "impl_try_from! {{ {} for {} if v => {} }}",
     get_flat_name(a)?,
     get_flat_name(e)?,
-    get_try_from_condition(e, a)?
+    get_try_from_check(e, a)?
   ));
   if let Some(b) = get_base_class(a) {
     add_local_try_from_impls(def, b)?;
@@ -375,8 +375,8 @@ fn visit_data_or_subclass(def: &mut Def) -> Option<()> {
   if let Some(b) = get_base_class(e) {
     def.add_line(format!(
       "impl_deref! {{ {} for {} }}",
-      get_flat_name(e)?,
-      get_flat_name(b)?
+      get_flat_name(b)?,
+      get_flat_name(e)?
     ));
     add_local_from_impls(def, b)?;
     add_local_try_from_impls(def, b)?;
