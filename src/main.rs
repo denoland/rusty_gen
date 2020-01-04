@@ -241,7 +241,7 @@ fn main() {
 
 fn boilerplate() -> &'static str {
   r#"
-// Copyright 2018-2019 the Deno authors. All rights reserved. MIT license.
+// Copyright 2019-2020 the Deno authors. All rights reserved. MIT license.
 
 use std::convert::From;
 use std::convert::TryFrom;
