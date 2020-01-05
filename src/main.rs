@@ -60,7 +60,7 @@ where
 struct ClassDef<'tu> {
   struct_definition: String,
   deref_impl: String,
-  from_trait_impls: ClassIndex<'tu, String>,
+  from_impls: ClassIndex<'tu, String>,
   try_from_impls: ClassIndex<'tu, String>,
 }
 
@@ -69,7 +69,7 @@ impl<'tu> ClassDef<'tu> {
     Self {
       struct_definition: Default::default(),
       deref_impl: Default::default(),
-      from_trait_impls: ClassIndex::new_with_cache(sort_key_cache.clone()),
+      from_impls: ClassIndex::new_with_cache(sort_key_cache.clone()),
       try_from_impls: ClassIndex::new_with_cache(sort_key_cache.clone()),
     }
   }
@@ -82,8 +82,8 @@ impl<'tu> ClassDef<'tu> {
     &mut self.deref_impl
   }
 
-  pub fn from_trait_impl(&mut self, from_class: Entity<'tu>) -> &mut String {
-    self.from_trait_impls.entry(from_class).or_default()
+  pub fn from_impl(&mut self, from_class: Entity<'tu>) -> &mut String {
+    self.from_impls.entry(from_class).or_default()
   }
 
   pub fn try_from_impl(&mut self, from_class: Entity<'tu>) -> &mut String {
@@ -99,7 +99,7 @@ impl<'tu> Display for ClassDef<'tu> {
       self.struct_definition,
       self.deref_impl,
       self.try_from_impls,
-      self.from_trait_impls,
+      self.from_impls,
     )
   }
 }
@@ -426,7 +426,7 @@ fn add_from_impls<'tu>(
   if let Some(ancestor_base) = get_base_class(ancestor) {
     add_from_impls(defs, class, ancestor_base)?;
   }
-  let w = defs.get_class_def(ancestor).from_trait_impl(class);
+  let w = defs.get_class_def(ancestor).from_impl(class);
   writeln!(
     w,
     "impl_from! {{ {} for {} }}",
