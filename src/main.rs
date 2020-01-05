@@ -3,6 +3,7 @@ use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt::{self, Display, Formatter, Write};
+use std::mem::replace;
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
 use std::process::exit;
@@ -62,6 +63,7 @@ struct ClassDef<'tu> {
   deref_impl: String,
   from_impls: ClassIndex<'tu, String>,
   try_from_impls: ClassIndex<'tu, String>,
+  visited: bool,
 }
 
 impl<'tu> ClassDef<'tu> {
@@ -71,6 +73,7 @@ impl<'tu> ClassDef<'tu> {
       deref_impl: Default::default(),
       from_impls: ClassIndex::new_with_cache(sort_key_cache.clone()),
       try_from_impls: ClassIndex::new_with_cache(sort_key_cache.clone()),
+      visited: false,
     }
   }
 
@@ -89,14 +92,25 @@ impl<'tu> ClassDef<'tu> {
   pub fn try_from_impl(&mut self, from_class: Entity<'tu>) -> &mut String {
     self.try_from_impls.entry(from_class).or_default()
   }
+
+  pub fn visited(&mut self) -> &mut bool {
+    &mut self.visited
+  }
+
+  fn has_traits(&self) -> bool {
+    !self.deref_impl.is_empty()
+      || !self.try_from_impls.is_empty()
+      || !self.from_impls.is_empty()
+  }
 }
 
 impl<'tu> Display for ClassDef<'tu> {
   fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
     write!(
       f,
-      "\n{}\n{}{}{}",
+      "\n{}{}{}{}{}",
       self.struct_definition,
+      if self.has_traits() { "\n" } else { "" },
       self.deref_impl,
       self.try_from_impls,
       self.from_impls,
@@ -171,7 +185,7 @@ impl ClassSortKey {
   }
 
   fn make_name_list(class: Entity) -> Vec<String> {
-    let mut sort_key = match get_base_class(class) {
+    let mut sort_key = match get_single_base_class(class) {
       Some(base) => Self::make_name_list(base),
       None => Vec::new(),
     };
@@ -312,14 +326,18 @@ impl Error for TryFromTypeError {}
   .trim()
 }
 
-fn get_base_class(e: Entity) -> Option<Entity> {
-  e.get_children()
+fn get_single_base_class(e: Entity) -> Option<Entity> {
+  let mut it = e
+    .get_children()
     .into_iter()
     .filter(|c| c.get_kind() == EntityKind::BaseSpecifier)
     .filter_map(|c| c.get_type())
     .filter_map(|t| t.get_declaration())
-    .filter_map(|b| b.get_definition())
-    .next()
+    .filter_map(|b| b.get_definition());
+  match it.next() {
+    Some(base) if it.next().is_none() => Some(base),
+    _ => None, // Return None if there are 0 or 2+ base classes.
+  }
 }
 
 fn get_direct_subclasses(e: Entity) -> Option<Vec<Entity>> {
@@ -356,8 +374,33 @@ fn is_data_class(e: Entity) -> bool {
     && e.get_semantic_parent().map(is_v8_ns).unwrap_or(false)
 }
 
-fn is_data_subclass(e: Entity) -> bool {
-  is_data_class(e) || get_base_class(e).map(is_data_subclass).unwrap_or(false)
+fn is_data_subclass_definition(e: Entity) -> bool {
+  e.is_definition()
+    && (is_data_class(e)
+      || get_single_base_class(e)
+        .map(is_data_subclass_definition)
+        .unwrap_or(false))
+}
+
+fn get_local_template_arg(e: Entity) -> Option<Entity> {
+  let ty = e.get_type()?;
+  let _def = ty
+    .get_declaration()
+    .and_then(|d| d.get_definition())
+    .filter(|d| {
+      d.get_kind() == EntityKind::ClassDecl
+        && d.get_name().map(|n| n == "Local").unwrap_or(false)
+        && d.get_semantic_parent().map(is_v8_ns).unwrap_or(false)
+    })?;
+  let mut args = ty
+    .get_template_argument_types()?
+    .into_iter()
+    .filter_map(|t| t?.get_declaration())
+    .filter_map(|b| b.get_definition());
+  match args.next() {
+    Some(a) if args.next().is_none() => Some(a),
+    _ => None, // Return None if there are 0 or 2+ type arguments.
+  }
 }
 
 // Returns the name of an entity for use in a flat namespace.
@@ -379,14 +422,13 @@ fn get_flat_name(e: Entity) -> String {
 }
 
 fn format_comment(comment: String) -> String {
+  let delims: &[_] = &['/', '*', ' ', '\n'];
   comment
+    .trim_start_matches(delims)
+    .trim_end_matches(delims)
+    .replacen("", "/// ", 1)
     .replace("\n * ", "\n/// ")
     .replace("\n *\n", "\n///\n")
-    .trim_start_matches("/**")
-    .trim_start()
-    .trim_end_matches("*/")
-    .trim_end()
-    .to_owned()
     .replace("\\code", "```ignore")
     .replace("\\endcode", "```")
     .replace(".  ", ". ")
@@ -423,7 +465,7 @@ fn add_from_impls<'tu>(
   class: Entity<'tu>,
   ancestor: Entity<'tu>,
 ) -> fmt::Result {
-  if let Some(ancestor_base) = get_base_class(ancestor) {
+  if let Some(ancestor_base) = get_single_base_class(ancestor) {
     add_from_impls(defs, class, ancestor_base)?;
   }
   let w = defs.get_class_def(ancestor).from_impl(class);
@@ -475,7 +517,7 @@ fn get_try_from_test_method<'tu>(
           .into_iter()
           .any(|p| p.get_kind() == ParmDecl)
     })
-    .or_else(|| get_try_from_test_method(e, get_base_class(a)?))
+    .or_else(|| get_try_from_test_method(e, get_single_base_class(a)?))
 }
 
 fn get_try_from_check<'tu>(
@@ -518,23 +560,33 @@ fn add_try_from_impls<'tu>(
       check
     )?;
   }
-  if let Some(ancestor_base) = get_base_class(ancestor) {
+  if let Some(ancestor_base) = get_single_base_class(ancestor) {
     add_try_from_impls(defs, class, ancestor_base)?;
   }
   Ok(())
 }
 
-fn visit_data_subclass<'tu>(
+fn visit_class<'tu>(
   defs: &'_ mut ClassDefIndex<'tu>,
   class: Entity<'tu>,
 ) -> fmt::Result {
   add_struct_definition(defs, class)?;
-  if let Some(base) = get_base_class(class) {
+  if let Some(base) = get_single_base_class(class) {
     add_deref_impl(defs, class, base)?;
     add_from_impls(defs, class, base)?;
     add_try_from_impls(defs, class, base)?;
   }
   Ok(())
+}
+
+fn maybe_visit_class<'tu>(
+  defs: &'_ mut ClassDefIndex<'tu>,
+  class: Entity<'tu>,
+) {
+  let visited = defs.get_class_def(class).visited();
+  if !replace(visited, true) {
+    visit_class(defs, class).unwrap()
+  }
 }
 
 fn visit_translation_unit<'tu>(
@@ -543,8 +595,14 @@ fn visit_translation_unit<'tu>(
 ) {
   let root = translation_unit.get_entity();
   root.visit_children(|e, _| {
-    if e.is_definition() && is_data_subclass(e) {
-      visit_data_subclass(defs, e).unwrap();
+    // Add all derivatives of v8::Data.
+    if is_data_subclass_definition(e) {
+      maybe_visit_class(defs, e)
+    }
+    // A small number of v8::Local<T> types are not a derivative of v8::Data.
+    // We find them by visiting the type parameter of every Local<T>.
+    if let Some(a) = get_local_template_arg(e) {
+      maybe_visit_class(defs, a)
     }
     EntityVisitResult::Recurse
   });
