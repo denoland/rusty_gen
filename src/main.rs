@@ -1,3 +1,4 @@
+mod callbacks;
 mod data;
 
 use std::path::Path;
@@ -39,5 +40,10 @@ fn main() {
     exit(1);
   }
 
-  data::generate_data_rs(tu);
+  callbacks::generate(&tu);
+
+  if false {
+    #[allow(unreachable_code)]
+    data::generate_data_rs(&tu)
+  }
 }

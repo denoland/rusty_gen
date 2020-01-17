@@ -492,9 +492,9 @@ fn visit_translation_unit<'tu>(
   });
 }
 
-pub fn generate_data_rs(tu: TranslationUnit) {
+pub fn generate_data_rs(tu: &TranslationUnit) {
   let mut defs = ClassDefIndex::new();
-  visit_translation_unit(&mut defs, &tu);
+  visit_translation_unit(&mut defs, tu);
 
   println!("{}", boilerplate());
   println!("{}", defs);
