@@ -280,11 +280,19 @@ fn get_direct_subclasses(e: Entity) -> Option<Vec<Entity>> {
   Some(subclasses)
 }
 
+// Note: a TranslationUnit is also a named entity.
+fn get_named_semantic_parent(e: Entity) -> Option<Entity> {
+  let p = e.get_semantic_parent()?;
+  match p.get_name() {
+    Some(_) => Some(p),
+    None => get_named_semantic_parent(p),
+  }
+}
+
 fn is_v8_ns(e: Entity) -> bool {
   e.get_kind() == EntityKind::Namespace
     && e.get_name().map(|n| n == "v8").unwrap_or(false)
-    && e
-      .get_semantic_parent()
+    && get_named_semantic_parent(e)
       .map(|p| p.get_kind() == EntityKind::TranslationUnit)
       .unwrap_or(false)
 }
@@ -366,6 +374,95 @@ fn is_type_used(translation_unit: &TranslationUnit, ty: Type) -> bool {
   })
 }
 
+enum TypeParams<'tu> {
+  Zero,
+  One(Type<'tu>),
+  Two(Type<'tu>, Type<'tu>),
+}
+
+fn is_v8_type<'tu>(ty: Type<'tu>, name: &str) -> Option<TypeParams<'tu>> {
+  let _def = ty
+    .get_declaration()
+    .filter(|d| d.get_name().map(|n| n == name).unwrap_or(false))
+    .filter(|d| d.get_semantic_parent().map(is_v8_ns).unwrap_or(false))?;
+  let mut ptys = ty.get_template_argument_types()?.into_iter();
+  let pty1 = ptys.next();
+  let pty2 = pty1.and_then(|_| ptys.next());
+  let pty3 = pty2.and_then(|_| ptys.next());
+  let info = match (pty1, pty2, pty3) {
+    (None, _, _) => TypeParams::Zero,
+    (Some(p), None, _) => TypeParams::One(p?),
+    (Some(p), Some(q), None) => TypeParams::Two(p?, q?),
+    _ => {
+      return None;
+    }
+  };
+  Some(info)
+}
+
+fn is_std_ns(e: Entity) -> bool {
+  e.get_kind() == EntityKind::Namespace
+    && e.get_name().map(|n| n == "std").unwrap_or(false)
+    && get_named_semantic_parent(e)
+      .map(|p| p.get_kind() == EntityKind::TranslationUnit)
+      .unwrap_or(false)
+}
+
+fn is_std_type<'tu>(ty: Type<'tu>, name: &str) -> bool {
+  ty.get_declaration()
+    .filter(|d| d.get_name().map(|n| n == name).unwrap_or(false))
+    .filter(|d| {
+      get_named_semantic_parent(*d)
+        .map(|p| is_std_ns(p) || p.get_kind() == EntityKind::TranslationUnit)
+        .unwrap_or(false)
+    })
+    .is_some()
+}
+
+#[derive(Debug, Clone)]
+enum TypeMapping<'tu> {
+  Void,
+  Bool,
+  IntN(u8),
+  UIntN(u8),
+  UIntSize,
+  Local(String),
+  MaybeLocal(String),
+  Unknown(Type<'tu>),
+}
+
+fn visit_type<'tu>(
+  defs: &'_ mut ClassDefIndex<'tu>,
+  ty: Type<'tu>,
+) -> Option<()> {
+  use TypeKind as K;
+  use TypeMapping as M;
+
+  let mapping = if ty.get_kind() == K::Void {
+    M::Void
+  } else if ty.get_kind() == K::Bool {
+    M::Bool
+  } else if is_std_type(ty, "int32_t") {
+    M::IntN(32)
+  } else if is_std_type(ty, "int64_t") {
+    M::IntN(64)
+  } else if is_std_type(ty, "uint32_t") {
+    M::UIntN(32)
+  } else if is_std_type(ty, "uint64_t") {
+    M::UIntN(64)
+  } else if is_std_type(ty, "size_t") || is_std_type(ty, "uintptr_t") {
+    M::UIntSize
+  } else if let Some(TypeParams::One(p)) = is_v8_type(ty, "Local") {
+    M::Local(p.get_display_name())
+  } else if let Some(TypeParams::One(p)) = is_v8_type(ty, "MaybeLocal") {
+    M::MaybeLocal(p.get_display_name())
+  } else {
+    M::Unknown(ty)
+  };
+  println!("T: {:?}", mapping);
+  Some(())
+}
+
 fn visit_callback_definition<'tu>(
   defs: &'_ mut ClassDefIndex<'tu>,
   e: Entity<'tu>,   // The typedef definition node.
@@ -379,7 +476,10 @@ fn visit_callback_definition<'tu>(
   let ret_ty = fn_ty.get_result_type()?;
   let arg_tys = fn_ty.get_argument_types()?;
   let arg_names = e.get_children();
-  println!("  {:?}", arg_names);
+  visit_type(defs, ret_ty).unwrap();
+  arg_tys
+    .into_iter()
+    .for_each(|a| visit_type(defs, a).unwrap());
   Some(())
 }
 
@@ -400,10 +500,6 @@ fn visit_declaration<'tu>(
       }
     }
   }
-  //if name.ends_with("Callback") {
-  //  println!("{:?}: {}", , name);
-  //}(
-  //maybe_visit_type(defs, e.get_type()?, 1);
   Some(())
 }
 
