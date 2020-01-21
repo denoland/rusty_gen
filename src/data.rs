@@ -270,7 +270,7 @@ fn get_local_template_arg(e: Entity) -> Option<Entity> {
   let ty = e.get_type()?;
   let _def = ty
     .get_declaration()
-    .and_then(|d| d.get_definition())
+    .map(|d| d.get_definition().unwrap_or(d))
     .filter(|d| {
       d.get_kind() == EntityKind::ClassDecl
         && d.get_name().map(|n| n == "Local").unwrap_or(false)
@@ -280,7 +280,7 @@ fn get_local_template_arg(e: Entity) -> Option<Entity> {
     .get_template_argument_types()?
     .into_iter()
     .filter_map(|t| t?.get_declaration())
-    .filter_map(|b| b.get_definition());
+    .map(|b| b.get_definition().unwrap_or(b));
   match args.next() {
     Some(a) if args.next().is_none() => Some(a),
     _ => None, // Return None if there are 0 or 2+ type arguments.
