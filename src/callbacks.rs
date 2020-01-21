@@ -303,6 +303,7 @@ fn get_flat_name_for_callback_type(e: Entity) -> String {
     if parent.get_kind() == EntityKind::Namespace
       || is_v8_top_level_class(parent, "Isolate")
       || is_v8_top_level_class(parent, "Context")
+      || (is_v8_top_level_class(parent, "Module") && name.contains("Module"))
     {
       break;
     } else if let Some(parent_name) = parent.get_name() {
@@ -365,6 +366,23 @@ fn is_type_used(translation_unit: &TranslationUnit, ty: Type) -> bool {
   })
 }
 
+fn visit_callback_definition<'tu>(
+  defs: &'_ mut ClassDefIndex<'tu>,
+  e: Entity<'tu>,   // The typedef definition node.
+  fn_ty: Type<'tu>, // The callback function prototype.
+) -> Option<()> {
+  println!(
+    "{:<50} => {}",
+    get_flat_name_for_callback_type(e),
+    fn_ty.get_display_name()
+  );
+  let ret_ty = fn_ty.get_result_type()?;
+  let arg_tys = fn_ty.get_argument_types()?;
+  let arg_names = e.get_children();
+  println!("  {:?}", arg_names);
+  Some(())
+}
+
 fn visit_declaration<'tu>(
   defs: &'_ mut ClassDefIndex<'tu>,
   e: Entity<'tu>,
@@ -376,11 +394,7 @@ fn visit_declaration<'tu>(
           if pointee_ty.get_kind() == TypeKind::FunctionPrototype
             && is_type_used(e.get_translation_unit(), ty)
           {
-            println!(
-              "{:<50} => {}",
-              get_flat_name_for_callback_type(e),
-              pointee_ty.get_display_name()
-            );
+            visit_callback_definition(defs, e, pointee_ty).unwrap();
           }
         }
       }
