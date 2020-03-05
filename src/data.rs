@@ -266,16 +266,15 @@ fn is_data_subclass_definition(e: Entity) -> bool {
         .unwrap_or(false))
 }
 
-fn get_local_template_arg(e: Entity) -> Option<Entity> {
-  let ty = e.get_type()?;
-  let _def = ty
-    .get_declaration()
-    .and_then(|d| d.get_definition())
-    .filter(|d| {
-      d.get_kind() == EntityKind::ClassDecl
-        && d.get_name().map(|n| n == "Local").unwrap_or(false)
-        && d.get_semantic_parent().map(is_v8_ns).unwrap_or(false)
-    })?;
+fn get_local_handle_data_type(ty: Type) -> Option<Entity> {
+  let _def = ty.get_declaration().filter(|d| {
+    d.get_kind() == EntityKind::ClassDecl
+      && d
+        .get_name()
+        .map(|n| n == "Local" || n == "MaybeLocal")
+        .unwrap_or(false)
+      && d.get_semantic_parent().map(is_v8_ns).unwrap_or(false)
+  })?;
   let mut args = ty
     .get_template_argument_types()?
     .into_iter()
@@ -485,7 +484,14 @@ fn visit_translation_unit<'tu>(
     }
     // A small number of v8::Local<T> types are not a derivative of v8::Data.
     // We find them by visiting the type parameter of every Local<T>.
-    if let Some(a) = get_local_template_arg(e) {
+    if let Some(a) = e.get_type().and_then(get_local_handle_data_type) {
+      maybe_visit_class(defs, a)
+    }
+    if let Some(a) = e
+      .get_type()
+      .and_then(|ty| ty.get_result_type())
+      .and_then(get_local_handle_data_type)
+    {
       maybe_visit_class(defs, a)
     }
     EntityVisitResult::Recurse
