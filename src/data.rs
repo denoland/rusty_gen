@@ -60,6 +60,8 @@ struct ClassDef<'tu> {
   deref_impl: String,
   from_impls: ClassIndex<'tu, String>,
   try_from_impls: ClassIndex<'tu, String>,
+  eq_impl: String,
+  partial_eq_impls: ClassIndex<'tu, String>,
   visited: bool,
 }
 
@@ -70,6 +72,8 @@ impl<'tu> ClassDef<'tu> {
       deref_impl: Default::default(),
       from_impls: ClassIndex::new_with_cache(sort_key_cache.clone()),
       try_from_impls: ClassIndex::new_with_cache(sort_key_cache.clone()),
+      eq_impl: Default::default(),
+      partial_eq_impls: ClassIndex::new_with_cache(sort_key_cache.clone()),
       visited: false,
     }
   }
@@ -90,6 +94,14 @@ impl<'tu> ClassDef<'tu> {
     self.try_from_impls.entry(from_class).or_default()
   }
 
+  pub fn eq_impl(&mut self) -> &mut String {
+    &mut self.eq_impl
+  }
+
+  pub fn partial_eq_impl(&mut self, other_class: Entity<'tu>) -> &mut String {
+    self.partial_eq_impls.entry(other_class).or_default()
+  }
+
   pub fn visited(&mut self) -> &mut bool {
     &mut self.visited
   }
@@ -98,6 +110,8 @@ impl<'tu> ClassDef<'tu> {
     !self.deref_impl.is_empty()
       || !self.try_from_impls.is_empty()
       || !self.from_impls.is_empty()
+      || !self.eq_impl.is_empty()
+      || !self.partial_eq_impls.is_empty()
   }
 }
 
@@ -105,12 +119,14 @@ impl<'tu> Display for ClassDef<'tu> {
   fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
     write!(
       f,
-      "\n{}{}{}{}{}",
+      "\n{}{}{}{}{}{}{}",
       self.struct_definition,
       if self.has_traits() { "\n" } else { "" },
       self.deref_impl,
       self.try_from_impls,
       self.from_impls,
+      self.eq_impl,
+      self.partial_eq_impls
     )
   }
 }
@@ -243,6 +259,17 @@ fn get_direct_subclasses(e: Entity) -> Option<Vec<Entity>> {
   Some(subclasses)
 }
 
+fn get_class_and_all_derived_classes(e: Entity) -> Option<Vec<Entity>> {
+  Some(
+    Some(e)
+      .into_iter()
+      .chain(get_direct_subclasses(e)?.into_iter().flat_map(|s| {
+        get_class_and_all_derived_classes(s).unwrap().into_iter()
+      }))
+      .collect::<Vec<_>>(),
+  )
+}
+
 fn is_v8_ns(e: Entity) -> bool {
   e.get_kind() == EntityKind::Namespace
     && e.get_name().map(|n| n == "v8").unwrap_or(false)
@@ -252,18 +279,29 @@ fn is_v8_ns(e: Entity) -> bool {
       .unwrap_or(false)
 }
 
-fn is_data_class(e: Entity) -> bool {
+fn is_class_in_v8_ns(e: Entity, class_name: &'static str) -> bool {
   e.get_kind() == EntityKind::ClassDecl
-    && e.get_name().map(|n| n == "Data").unwrap_or(false)
+    && e.get_name().map(|n| n == class_name).unwrap_or(false)
     && e.get_semantic_parent().map(is_v8_ns).unwrap_or(false)
 }
 
-fn is_data_subclass_definition(e: Entity) -> bool {
-  e.is_definition()
-    && (is_data_class(e)
-      || get_single_base_class(e)
-        .map(is_data_subclass_definition)
-        .unwrap_or(false))
+// This function also returns `true` if `e` itself has name `v8::{class_name}`.
+fn has_base_class_in_v8_ns(e: Entity, class_name: &'static str) -> bool {
+  is_class_in_v8_ns(e, class_name)
+    || get_single_base_class(e)
+      .map(|b| has_base_class_in_v8_ns(b, class_name))
+      .unwrap_or(false)
+}
+
+// This function also returns `true` if `e` itself has name `v8::{class_name}`.
+fn has_derived_class_in_v8_ns(e: Entity, class_name: &'static str) -> bool {
+  get_class_and_all_derived_classes(e)
+    .map(|descendants| {
+      descendants
+        .into_iter()
+        .any(|s| is_class_in_v8_ns(s, class_name))
+    })
+    .unwrap_or(false)
 }
 
 fn get_local_handle_data_type(ty: Type) -> Option<Entity> {
@@ -449,11 +487,115 @@ fn add_try_from_impls<'tu>(
   Ok(())
 }
 
+fn is_class_comparable_by_identity(e: Entity) -> bool {
+  // A class supports comparison by identity if:
+  //  - EITHER it is any of the following classes:
+  //      - `v8::Boolean`
+  //      - `v8::Symbol`
+  //  - OR it is NOT any of the following:
+  //      - A base class of `v8::Primitive`.
+  //      - The class `v8::Primitive` itself.
+  //      - A class derived from `v8:Primitive`.
+  //
+  // Optimization: searching all derived classes is quite slow for classes
+  // with many descendants. Therefore, some classes are hard coded:
+  //   - Comparable by identity: `Object`. `ArrayBufferView`, `TypedArray`.
+  //   - NOT comparable by identity: `Data`, `Value`.
+  is_class_in_v8_ns(e, "Boolean")
+    || is_class_in_v8_ns(e, "Symbol")
+    || is_class_in_v8_ns(e, "Object")
+    || is_class_in_v8_ns(e, "ArrayBufferView")
+    || is_class_in_v8_ns(e, "TypedArray")
+    || !(is_class_in_v8_ns(e, "Data")
+      || is_class_in_v8_ns(e, "Value")
+      || has_base_class_in_v8_ns(e, "Primitive")
+      || has_derived_class_in_v8_ns(e, "Primitive"))
+}
+
+fn is_class_comparable_by_strict_equals(e: Entity) -> bool {
+  has_base_class_in_v8_ns(e, "Value")
+}
+
+fn get_partial_eq_compare_method(
+  class1: Entity,
+  class2: Entity,
+) -> Option<&'static str> {
+  // Comparison by identity is possible if the type on *either* side of the
+  // comparison supports this. However, comparison by strict equality is only
+  // possible when the types on *both* sides support it.
+  if is_class_comparable_by_identity(class1)
+    || is_class_comparable_by_identity(class2)
+  {
+    Some("identity")
+  } else if is_class_comparable_by_strict_equals(class1)
+    && is_class_comparable_by_strict_equals(class2)
+  {
+    Some("strict_equals")
+  } else {
+    None
+  }
+}
+
+fn add_partial_eq_impl<'tu>(
+  defs: &'_ mut ClassDefIndex<'tu>,
+  lhs: Entity<'tu>,
+  rhs: Entity<'tu>,
+  compare_method: &'static str,
+) -> fmt::Result {
+  let w = defs.get_class_def(lhs).partial_eq_impl(rhs);
+  writeln!(
+    w,
+    "impl_partial_eq! {{ {} for {} use {} }}",
+    get_flat_name(rhs),
+    get_flat_name(lhs),
+    compare_method,
+  )
+}
+
+fn add_partial_eq_impls<'tu>(
+  defs: &'_ mut ClassDefIndex<'tu>,
+  class: Entity<'tu>,
+  ancestor: Entity<'tu>,
+) -> fmt::Result {
+  if let Some(compare_method) = get_partial_eq_compare_method(class, ancestor) {
+    // Implement `PartialEq<Ancestor> for Class`.
+    add_partial_eq_impl(defs, class, ancestor, compare_method)?;
+    if class != ancestor {
+      // When `Class` and `Ancestor` are not the same, also implement the
+      // reverse comparison `PartialEq<Class> for Ancestor`.
+      add_partial_eq_impl(defs, ancestor, class, compare_method)?;
+    }
+  }
+  if let Some(ancestor_base) = get_single_base_class(ancestor) {
+    add_partial_eq_impls(defs, class, ancestor_base)?;
+  }
+  Ok(())
+}
+
+fn maybe_add_eq_impl<'tu>(
+  defs: &'_ mut ClassDefIndex<'tu>,
+  class: Entity<'tu>,
+) -> fmt::Result {
+  // Total equality (the `Eq` trait) requires that comparison between two
+  // values of the same type is reflexive (a == a). This true for all JavaScript
+  // types except `Number`, because NaN != NaN. Therefore we implement Eq for
+  // all classes except `Number` and it's base classes.
+  if get_partial_eq_compare_method(class, class).is_some()
+    && !has_derived_class_in_v8_ns(class, "Number")
+  {
+    let w = defs.get_class_def(class).eq_impl();
+    writeln!(w, "impl_eq! {{ for {} }}", get_flat_name(class))?;
+  }
+  Ok(())
+}
+
 fn visit_class<'tu>(
   defs: &'_ mut ClassDefIndex<'tu>,
   class: Entity<'tu>,
 ) -> fmt::Result {
   add_struct_definition(defs, class)?;
+  maybe_add_eq_impl(defs, class)?;
+  add_partial_eq_impls(defs, class, class)?;
   if let Some(base) = get_single_base_class(class) {
     add_deref_impl(defs, class, base)?;
     add_from_impls(defs, class, base)?;
@@ -479,7 +621,7 @@ fn visit_translation_unit<'tu>(
   let root = translation_unit.get_entity();
   root.visit_children(|e, _| {
     // Add all derivatives of v8::Data.
-    if is_data_subclass_definition(e) {
+    if e.is_definition() && has_base_class_in_v8_ns(e, "Data") {
       maybe_visit_class(defs, e)
     }
     // A small number of v8::Local<T> types are not a derivative of v8::Data.
@@ -513,6 +655,7 @@ fn boilerplate() -> &'static str {
 use std::convert::From;
 use std::convert::TryFrom;
 use std::error::Error;
+use std::ffi::c_void;
 use std::fmt;
 use std::fmt::Display;
 use std::fmt::Formatter;
@@ -555,6 +698,33 @@ macro_rules! impl_try_from {
       }
     }
   };
+}
+
+macro_rules! impl_eq {
+  { for $type:ident } => {
+    impl<'sc> Eq for Local<'sc, $type> {}
+  };
+}
+
+macro_rules! impl_partial_eq {
+  { $rhs:ident for $type:ident use identity } => {
+    impl<'sc> PartialEq<Local<'sc, $rhs>> for Local<'sc, $type> {
+      fn eq(&self, other: &Local<'sc, $rhs>) -> bool {
+        unsafe { v8__Local__EQ(transmute(*self), transmute(*other)) }
+      }
+    }
+  };
+  { $rhs:ident for $type:ident use strict_equals } => {
+    impl<'sc> PartialEq<Local<'sc, $rhs>> for Local<'sc, $type> {
+      fn eq(&self, other: &Local<'sc, $rhs>) -> bool {
+        self.strict_equals((*other).into())
+      }
+    }
+  };
+}
+
+extern "C" {
+  fn v8__Local__EQ(this: Local<c_void>, other: Local<c_void>) -> bool;
 }
 
 #[derive(Clone, Copy, Debug)]
