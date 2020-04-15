@@ -349,6 +349,7 @@ fn format_comment(comment: String) -> String {
     .trim_end_matches(delims)
     .replacen("", "/// ", 1)
     .replace("\n * ", "\n/// ")
+    .replace("\n   ", "\n/// ")
     .replace("\n *\n", "\n///\n")
     .replace("\\code", "```ignore")
     .replace("\\endcode", "```")
