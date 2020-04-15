@@ -198,7 +198,7 @@ impl ClassSortKey {
   }
 
   fn make_name_list(class: Entity) -> Vec<String> {
-    let mut sort_key = match get_single_base_class(class) {
+    let mut sort_key = match get_single_base_class_or_v8_data(class) {
       Some(base) => Self::make_name_list(base),
       None => Vec::new(),
     };
@@ -226,7 +226,13 @@ impl Ord for ClassSortKey {
   }
 }
 
-fn get_single_base_class(e: Entity) -> Option<Entity> {
+#[derive(Copy, Clone, Debug)]
+enum NoSingleBaseClass {
+  None,
+  MoreThanOne,
+}
+
+fn get_single_base_class(e: Entity) -> Result<Entity, NoSingleBaseClass> {
   let mut it = e
     .get_children()
     .into_iter()
@@ -235,8 +241,29 @@ fn get_single_base_class(e: Entity) -> Option<Entity> {
     .filter_map(|t| t.get_declaration())
     .filter_map(|b| b.get_definition());
   match it.next() {
-    Some(base) if it.next().is_none() => Some(base),
-    _ => None, // Return None if there are 0 or 2+ base classes.
+    Some(base) if it.next().is_none() => Ok(base),
+    Some(_) => Err(NoSingleBaseClass::MoreThanOne),
+    None => Err(NoSingleBaseClass::None),
+  }
+}
+
+// Returns the actual base class for `e`, or `v8::Data` if the class has no
+// base class at all.
+fn get_single_base_class_or_v8_data(e: Entity) -> Option<Entity> {
+  match get_single_base_class(e) {
+    Ok(base) => Some(base),
+    Err(NoSingleBaseClass::MoreThanOne) => None,
+    Err(NoSingleBaseClass::None) if is_class_in_v8_ns(e, "Data") => None,
+    Err(NoSingleBaseClass::None) => e
+      .get_translation_unit()
+      .get_entity()
+      .get_children()
+      .into_iter()
+      .filter(|&e| is_v8_ns(e))
+      .flat_map(|e| e.get_children().into_iter())
+      .filter(|&e| is_class_in_v8_ns(e, "Data"))
+      .filter_map(|e| e.get_definition())
+      .next(),
   }
 }
 
@@ -387,7 +414,7 @@ fn add_from_impls<'tu>(
   class: Entity<'tu>,
   ancestor: Entity<'tu>,
 ) -> fmt::Result {
-  if let Some(ancestor_base) = get_single_base_class(ancestor) {
+  if let Some(ancestor_base) = get_single_base_class_or_v8_data(ancestor) {
     add_from_impls(defs, class, ancestor_base)?;
   }
   let w = defs.get_class_def(ancestor).from_impl(class);
@@ -439,7 +466,9 @@ fn get_try_from_test_method<'tu>(
           .into_iter()
           .any(|p| p.get_kind() == ParmDecl)
     })
-    .or_else(|| get_try_from_test_method(e, get_single_base_class(a)?))
+    .or_else(|| {
+      get_try_from_test_method(e, get_single_base_class_or_v8_data(a)?)
+    })
 }
 
 fn get_try_from_check<'tu>(
@@ -482,7 +511,7 @@ fn add_try_from_impls<'tu>(
       check
     )?;
   }
-  if let Some(ancestor_base) = get_single_base_class(ancestor) {
+  if let Some(ancestor_base) = get_single_base_class_or_v8_data(ancestor) {
     add_try_from_impls(defs, class, ancestor_base)?;
   }
   Ok(())
@@ -567,7 +596,7 @@ fn add_partial_eq_impls<'tu>(
       add_partial_eq_impl(defs, ancestor, class, compare_method)?;
     }
   }
-  if let Some(ancestor_base) = get_single_base_class(ancestor) {
+  if let Some(ancestor_base) = get_single_base_class_or_v8_data(ancestor) {
     add_partial_eq_impls(defs, class, ancestor_base)?;
   }
   Ok(())
@@ -597,7 +626,7 @@ fn visit_class<'tu>(
   add_struct_definition(defs, class)?;
   maybe_add_eq_impl(defs, class)?;
   add_partial_eq_impls(defs, class, class)?;
-  if let Some(base) = get_single_base_class(class) {
+  if let Some(base) = get_single_base_class_or_v8_data(class) {
     add_deref_impl(defs, class, base)?;
     add_from_impls(defs, class, base)?;
     add_try_from_impls(defs, class, base)?;
@@ -656,7 +685,6 @@ fn boilerplate() -> &'static str {
 use std::convert::From;
 use std::convert::TryFrom;
 use std::error::Error;
-use std::ffi::c_void;
 use std::fmt;
 use std::fmt::Display;
 use std::fmt::Formatter;
@@ -711,7 +739,7 @@ macro_rules! impl_partial_eq {
   { $rhs:ident for $type:ident use identity } => {
     impl<'sc> PartialEq<Local<'sc, $rhs>> for Local<'sc, $type> {
       fn eq(&self, other: &Local<'sc, $rhs>) -> bool {
-        unsafe { v8__Local__EQ(transmute(*self), transmute(*other)) }
+        self.eq_identity((*other).into())
       }
     }
   };
@@ -725,7 +753,13 @@ macro_rules! impl_partial_eq {
 }
 
 extern "C" {
-  fn v8__Local__EQ(this: Local<c_void>, other: Local<c_void>) -> bool;
+  fn v8__Data__EQ(this: *const Data, other: *const Data) -> bool;
+}
+
+impl Data {
+  fn eq_identity(&self, other: Local<Self>) -> bool {
+    unsafe { v8__Data__EQ(self, &*other) }
+  }
 }
 
 #[derive(Clone, Copy, Debug)]
