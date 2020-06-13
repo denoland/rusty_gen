@@ -1,4 +1,5 @@
 mod data;
+mod structs;
 
 use std::path::Path;
 use std::process::exit;
@@ -39,5 +40,9 @@ fn main() {
     exit(1);
   }
 
-  data::generate_data_rs(tu);
+  if false {
+    data::generate_data_rs(tu);
+  } else {
+    structs::generate(tu)
+  }
 }
