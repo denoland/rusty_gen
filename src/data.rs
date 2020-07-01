@@ -707,8 +707,8 @@ macro_rules! impl_deref {
 
 macro_rules! impl_from {
   { $source:ident for $type:ident } => {
-    impl<'sc> From<Local<'sc, $source>> for Local<'sc, $type> {
-      fn from(l: Local<'sc, $source>) -> Self {
+    impl<'s> From<Local<'s, $source>> for Local<'s, $type> {
+      fn from(l: Local<'s, $source>) -> Self {
         unsafe { transmute(l) }
       }
     }
@@ -717,9 +717,9 @@ macro_rules! impl_from {
 
 macro_rules! impl_try_from {
   { $source:ident for $target:ident if $value:pat => $check:expr } => {
-    impl<'sc> TryFrom<Local<'sc, $source>> for Local<'sc, $target> {
+    impl<'s> TryFrom<Local<'s, $source>> for Local<'s, $target> {
       type Error = TryFromTypeError;
-      fn try_from(l: Local<'sc, $source>) -> Result<Self, Self::Error> {
+      fn try_from(l: Local<'s, $source>) -> Result<Self, Self::Error> {
         match l {
           $value if $check => Ok(unsafe { transmute(l) }),
           _ => Err(TryFromTypeError::new(stringify!($target)))
@@ -731,35 +731,40 @@ macro_rules! impl_try_from {
 
 macro_rules! impl_eq {
   { for $type:ident } => {
-    impl<'sc> Eq for Local<'sc, $type> {}
-  };
-}
-
-macro_rules! impl_partial_eq {
-  { $rhs:ident for $type:ident use identity } => {
-    impl<'sc> PartialEq<Local<'sc, $rhs>> for Local<'sc, $type> {
-      fn eq(&self, other: &Local<'sc, $rhs>) -> bool {
-        self.eq_identity((*other).into())
-      }
-    }
-  };
-  { $rhs:ident for $type:ident use strict_equals } => {
-    impl<'sc> PartialEq<Local<'sc, $rhs>> for Local<'sc, $type> {
-      fn eq(&self, other: &Local<'sc, $rhs>) -> bool {
-        self.strict_equals((*other).into())
-      }
-    }
+    impl<'s> Eq for Local<'s, $type> {}
   };
 }
 
 extern "C" {
   fn v8__Data__EQ(this: *const Data, other: *const Data) -> bool;
+  fn v8__Value__StrictEquals(this: *const Value, other: *const Value) -> bool;
 }
 
-impl Data {
-  fn eq_identity(&self, other: Local<Self>) -> bool {
-    unsafe { v8__Data__EQ(self, &*other) }
-  }
+macro_rules! impl_partial_eq {
+  { $rhs:ident for $type:ident use identity } => {
+    impl<'s> PartialEq<$rhs> for $type {
+      fn eq(&self, other: &$rhs) -> bool {
+        unsafe {
+          v8__Data__EQ(
+            self as *const _ as *const Data,
+            other as *const _ as *const Data,
+          )
+        }
+      }
+    }
+  };
+  { $rhs:ident for $type:ident use strict_equals } => {
+    impl<'s> PartialEq<$rhs> for $type {
+      fn eq(&self, other: &$rhs) -> bool {
+        unsafe {
+          v8__Value__StrictEquals(
+            self as *const _ as *const Value,
+            other as *const _ as *const Value,
+          )
+        }
+      }
+    }
+  };
 }
 
 #[derive(Clone, Copy, Debug)]
