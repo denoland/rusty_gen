@@ -62,6 +62,7 @@ struct ClassDef<'tu> {
   try_from_impls: ClassIndex<'tu, String>,
   eq_impl: String,
   partial_eq_impls: ClassIndex<'tu, String>,
+  hash_impl: String,
   visited: bool,
 }
 
@@ -74,6 +75,7 @@ impl<'tu> ClassDef<'tu> {
       try_from_impls: ClassIndex::new_with_cache(sort_key_cache.clone()),
       eq_impl: Default::default(),
       partial_eq_impls: ClassIndex::new_with_cache(sort_key_cache.clone()),
+      hash_impl: Default::default(),
       visited: false,
     }
   }
@@ -102,6 +104,10 @@ impl<'tu> ClassDef<'tu> {
     self.partial_eq_impls.entry(other_class).or_default()
   }
 
+  pub fn hash_impl(&mut self) -> &mut String {
+    &mut self.hash_impl
+  }
+
   pub fn visited(&mut self) -> &mut bool {
     &mut self.visited
   }
@@ -112,6 +118,7 @@ impl<'tu> ClassDef<'tu> {
       || !self.from_impls.is_empty()
       || !self.eq_impl.is_empty()
       || !self.partial_eq_impls.is_empty()
+      || !self.hash_impl.is_empty()
   }
 }
 
@@ -119,14 +126,15 @@ impl<'tu> Display for ClassDef<'tu> {
   fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
     write!(
       f,
-      "\n{}{}{}{}{}{}{}",
+      "\n{}{}{}{}{}{}{}{}",
       self.struct_definition,
       if self.has_traits() { "\n" } else { "" },
       self.deref_impl,
       self.try_from_impls,
       self.from_impls,
       self.eq_impl,
-      self.partial_eq_impls
+      self.hash_impl,
+      self.partial_eq_impls,
     )
   }
 }
@@ -631,13 +639,16 @@ fn add_partial_eq_impls<'tu>(
   Ok(())
 }
 
-fn maybe_add_eq_impl<'tu>(
+fn maybe_add_eq_and_hash_impl<'tu>(
   defs: &'_ mut ClassDefIndex<'tu>,
   class: Entity<'tu>,
 ) -> fmt::Result {
   if get_partial_eq_compare_method(class, class).is_some() {
-    let w = defs.get_class_def(class).eq_impl();
-    writeln!(w, "impl_eq! {{ for {} }}", get_flat_name(class))?;
+    let class_def = defs.get_class_def(class);
+    let w_eq = class_def.eq_impl();
+    writeln!(w_eq, "impl_eq! {{ for {} }}", get_flat_name(class))?;
+    let w_hash = class_def.hash_impl();
+    writeln!(w_hash, "impl_hash! {{ for {} }}", get_flat_name(class))?;
   }
   Ok(())
 }
@@ -647,7 +658,7 @@ fn visit_class<'tu>(
   class: Entity<'tu>,
 ) -> fmt::Result {
   add_struct_definition(defs, class)?;
-  maybe_add_eq_impl(defs, class)?;
+  maybe_add_eq_and_hash_impl(defs, class)?;
   add_partial_eq_impls(defs, class, class)?;
   if let Some(base) = get_single_base_class_or_v8_data(class) {
     add_deref_impl(defs, class, base)?;
