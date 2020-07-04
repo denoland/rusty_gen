@@ -544,6 +544,11 @@ fn is_class_comparable_by_identity(e: Entity) -> bool {
 
 fn is_class_comparable_by_strict_equals(e: Entity) -> bool {
   has_base_class_in_v8_ns(e, "Value")
+    && !has_derived_class_in_v8_ns(e, "Number")
+}
+
+fn is_class_comparable_by_same_value_zero(e: Entity) -> bool {
+  has_base_class_in_v8_ns(e, "Value")
 }
 
 fn get_partial_eq_compare_method(
@@ -561,6 +566,30 @@ fn get_partial_eq_compare_method(
     && is_class_comparable_by_strict_equals(class2)
   {
     Some("strict_equals")
+  } else if is_class_comparable_by_same_value_zero(class1)
+    && is_class_comparable_by_same_value_zero(class2)
+  {
+    // Total equality (the `Eq` trait) requires that comparison between two
+    // values of the same type is reflexive (a == a). This true for all
+    // JavaScript types except `Number`, because NaN != NaN. However, for
+    // practical reasons such as being able to add a `v8::Value` to a HashMap,
+    // we do want to implement `Eq` for all its descendants including `Number`.
+    // So we use the semantics EcmaScript defines when e.g. an element is added
+    // to a Set and it has to decide whether that element already existed in the
+    // set before. The abstract operation is called `SameValueZero`, which is
+    // essentially defined as follows:
+    // (ECMA-262 6th edition § 7.2.10;
+    //  http://ecma-international.org/ecma-262/6.0/#sec-samevaluezero)
+    //
+    // ```js
+    // function same_value_zero(a, b) {
+    //   return Object.is(a, b) || (a === 0 && b === 0);
+    // }
+    // ```
+    //
+    // The only difference with `Value::SameValue()` and `Object.is()` is that
+    // `-0` and `0` compare equal under these rules.
+    Some("same_value_zero")
   } else {
     None
   }
@@ -606,13 +635,7 @@ fn maybe_add_eq_impl<'tu>(
   defs: &'_ mut ClassDefIndex<'tu>,
   class: Entity<'tu>,
 ) -> fmt::Result {
-  // Total equality (the `Eq` trait) requires that comparison between two
-  // values of the same type is reflexive (a == a). This true for all JavaScript
-  // types except `Number`, because NaN != NaN. Therefore we implement Eq for
-  // all classes except `Number` and it's base classes.
-  if get_partial_eq_compare_method(class, class).is_some()
-    && !has_derived_class_in_v8_ns(class, "Number")
-  {
+  if get_partial_eq_compare_method(class, class).is_some() {
     let w = defs.get_class_def(class).eq_impl();
     writeln!(w, "impl_eq! {{ for {} }}", get_flat_name(class))?;
   }
@@ -731,12 +754,13 @@ macro_rules! impl_try_from {
 
 macro_rules! impl_eq {
   { for $type:ident } => {
-    impl<'s> Eq for Local<'s, $type> {}
+    impl<'s> Eq for $type {}
   };
 }
 
 extern "C" {
   fn v8__Data__EQ(this: *const Data, other: *const Data) -> bool;
+  fn v8__Value__SameValue(this: *const Value, other: *const Value) -> bool;
   fn v8__Value__StrictEquals(this: *const Value, other: *const Value) -> bool;
 }
 
@@ -744,23 +768,31 @@ macro_rules! impl_partial_eq {
   { $rhs:ident for $type:ident use identity } => {
     impl<'s> PartialEq<$rhs> for $type {
       fn eq(&self, other: &$rhs) -> bool {
-        unsafe {
-          v8__Data__EQ(
-            self as *const _ as *const Data,
-            other as *const _ as *const Data,
-          )
-        }
+        let a = self as *const _ as *const Data;
+        let b = other as *const _ as *const Data;
+        unsafe { v8__Data__EQ(a, b) }
       }
     }
   };
   { $rhs:ident for $type:ident use strict_equals } => {
     impl<'s> PartialEq<$rhs> for $type {
       fn eq(&self, other: &$rhs) -> bool {
+        let a = self as *const _ as *const Value;
+        let b = other as *const _ as *const Value;
+        unsafe { v8__Value__StrictEquals(a, b) }
+      }
+    }
+  };
+  { $rhs:ident for $type:ident use same_value_zero } => {
+    impl<'s> PartialEq<$rhs> for $type {
+      fn eq(&self, other: &$rhs) -> bool {
+        let a = self as *const _ as *const Value;
+        let b = other as *const _ as *const Value;
         unsafe {
-          v8__Value__StrictEquals(
-            self as *const _ as *const Value,
-            other as *const _ as *const Value,
-          )
+          v8__Value__SameValue(a, b) || {
+            let zero = &*Local::<Value>::from(Integer::zero());
+            v8__Value__StrictEquals(a, zero) && v8__Value__StrictEquals(b, zero)
+          }
         }
       }
     }
