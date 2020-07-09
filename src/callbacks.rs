@@ -394,10 +394,14 @@ fn is_v8_type_pointee<'tu>(ty: Type<'tu>, name: &str) -> Option<Type<'tu>> {
   ty.get_pointee_type().and_then(|ty| is_v8_type(ty, name))
 }
 
+fn is_void_type<'tu>(ty: Type<'tu>) -> bool {
+  ty.get_kind() == TypeKind::Void
+}
+
 fn get_type_name<'tu>(ty: Type<'tu>) -> Option<String> {
   match ty.get_declaration() {
     Some(d) => d.get_name(),
-    None if ty.get_kind() == TypeKind::Void => Some("void".to_owned()),
+    None if is_void_type(ty) => Some("void".to_owned()),
     None => None,
   }
 }
@@ -628,6 +632,7 @@ fn visit_type<'tu>(
     let ret_ty_name = get_type_params(ty2)
       .and_then(|ps| match ps {
         TypeParams::Zero => None,
+        TypeParams::One(p) if is_void_type(p) => None,
         TypeParams::One(p) => Some(p),
         _ => panic!(),
       })
