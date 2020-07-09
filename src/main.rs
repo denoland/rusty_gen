@@ -28,10 +28,8 @@ impl<T: Sized> Unit for T {}
 
 trait CxxCallback<F>: Unit {
   type CxxFn;
-  fn cxx_callback() -> Self::CxxFn;
+  fn cxx_fn() -> Self::CxxFn;
 }
-
-///// MyCallback
 
 pub trait MyCallback:
   Unit + for<'a> FnOnce(&mut HandleScope<'a>, Local<'a>, i32) -> Local<'a>
@@ -41,17 +39,16 @@ impl<F: for<'a> FnOnce(&mut HandleScope<'a>, Local<'a>, i32) -> Local<'a>>
   MyCallback for F
 {
 }
-type CxxMyCallback = for<'a> extern "C" fn(
-  *mut Local<'a>,
-  *mut Isolate,
-  Local<'a>,
-  i32,
-) -> *mut Local<'a>;
 
 impl<F: MyCallback> CxxCallback<Self> for F {
-  type CxxFn = CxxMyCallback;
+  type CxxFn = for<'a> extern "C" fn(
+    *mut Local<'a>,
+    *mut Isolate,
+    Local<'a>,
+    i32,
+  ) -> *mut Local<'a>;
 
-  fn cxx_callback() -> Self::CxxFn {
+  fn cxx_fn() -> Self::CxxFn {
     #[inline(always)]
     fn signature_adapter<'a, F: MyCallback>(
       isolate: *mut Isolate,
@@ -77,12 +74,6 @@ impl<F: MyCallback> CxxCallback<Self> for F {
   }
 }
 
-impl<F: MyCallback> Borrow<CxxMyCallback> for F {
-  fn borrow(&self) -> CxxMyCallback {
-    F::cxx_callback()
-  }
-}
-
 mod my_callback_tests {
   use super::*;
 
@@ -90,8 +81,8 @@ mod my_callback_tests {
     let _ = convert_to_cxx(&callback);
   }
 
-  fn convert_to_cxx<F: MyCallback>(_: &F) -> CxxMyCallback {
-    F::cxx_callback()
+  fn convert_to_cxx<F: CxxCallback<F>>(_: &F) -> F::CxxFn {
+    F::cxx_fn()
   }
 
   fn callback<'s>(
@@ -121,7 +112,7 @@ type CxxOtherCallback<T> =
 impl<T: Sized, F: OtherCallback<T>> CxxCallback<CxxOtherCallback<T>> for F {
   type CxxFn = CxxOtherCallback<T>;
 
-  fn cxx_callback() -> Self::CxxFn {
+  fn cxx_fn() -> Self::CxxFn {
     #[inline(always)]
     fn signature_adapter<'a, T: Sized, F: OtherCallback<T>>(
       isolate: *mut Isolate,
