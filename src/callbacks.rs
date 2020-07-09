@@ -12,6 +12,7 @@ use std::iter::empty;
 use std::iter::once;
 use std::marker::PhantomData;
 use std::mem::transmute;
+use std::fmt::Write;
 use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
 
@@ -259,7 +260,7 @@ fn get_single_base_class(e: Entity) -> Option<Entity> {
     .filter_map(|b| b.get_definition());
   match it.next() {
     Some(base) if it.next().is_none() => Some(base),
-    _ => None, // Returns None if there are 0 or 2+ base classes.
+    _ => None, // ReturnValue None if there are 0 or 2+ base classes.
   }
 }
 
@@ -447,7 +448,7 @@ struct Sig<'tu> {
 
 #[derive(Debug, Clone)]
 enum SigIdent {
-  Returns,
+  ReturnValue,
   Anonymous,
   Param(String),
 }
@@ -455,15 +456,16 @@ enum SigIdent {
 #[derive(Debug, Clone)]
 enum SigType<'tu> {
   Void,
+  VoidPtr { mutable: bool },
   Bool,
   Int { signed: bool },
-  FixedInt { bits: u8, signed: bool },
-  IntPtr { signed: bool },
+  IntFixedSize { bits: u8, signed: bool },
+  IntPtrSize { signed: bool },
   Local(String),
   MaybeLocal(String),
-  Isolate { mutable: bool },
+  IsolatePtr { mutable: bool },
   StartupData { mutable: bool },
-  CallbackInfo { name: String, ret_ty_name: String },
+  CallbackInfoPtr { name: String, ret_ty_name: String },
   Unknown(Type<'tu>),
 }
 
@@ -477,12 +479,29 @@ impl<'tu> From<(Option<String>, Type<'tu>)> for Sig<'tu> {
 }
 
 impl<'tu> Sig<'tu> {
-  fn returns(ret_ty: Type<'tu>) -> Self {
+  fn return_value(ret_ty: Type<'tu>) -> Self {
     Self {
-      id: SigIdent::Returns,
+      id: SigIdent::ReturnValue,
       ty: ret_ty.into(),
     }
   }
+
+  fn add_var_name(&self, s: &mut String) -> fmt::Result {
+    match &self.id {
+      SigIdent::ReturnValue => s.write_str("return_value"),
+      SigIdent::Param(name) if name == "data" && self.ty.is_void_ptr() => {
+        s.write_str( "embedder_data")
+      }
+      SigIdent::Param(name) => s.write_str(name),
+      SigIdent::Anonymous => match self.ty {
+        SigType::IsolatePtr { .. } => s.write_str( "isolate"),
+        SigType::CallbackInfoPtr { .. } => s.write_str("info"),
+        _ => s.write_str("«?»"),
+      },
+    }
+  }
+
+  fn get_
 }
 
 impl From<Option<String>> for SigIdent {
@@ -499,34 +518,40 @@ impl<'tu> From<Type<'tu>> for SigType<'tu> {
 
     if ty.get_kind() == K::Void {
       M::Void
+    } else if let Some(pty) =
+      ty.get_pointee_type().filter(|&p| !is_void_type(p))
+    {
+      M::VoidPtr {
+        mutable: !pty.is_const_qualified(),
+      }
     } else if ty.get_kind() == K::Bool {
       M::Bool
     } else if ty.get_kind() == K::Int {
       M::Int { signed: true }
     } else if is_std_type(ty, "int32_t") {
-      M::FixedInt {
+      M::IntFixedSize {
         bits: 32,
         signed: true,
       }
     } else if is_std_type(ty, "int64_t") {
-      M::FixedInt {
+      M::IntFixedSize {
         bits: 64,
         signed: true,
       }
     } else if is_std_type(ty, "uint32_t") {
-      M::FixedInt {
+      M::IntFixedSize {
         bits: 32,
         signed: false,
       }
     } else if is_std_type(ty, "uint64_t") {
-      M::FixedInt {
+      M::IntFixedSize {
         bits: 64,
         signed: false,
       }
     } else if is_std_type(ty, "ssize_t") || is_std_type(ty, "intptr_t") {
-      M::IntPtr { signed: true }
+      M::IntPtrSize { signed: true }
     } else if is_std_type(ty, "size_t") || is_std_type(ty, "uintptr_t") {
-      M::IntPtr { signed: false }
+      M::IntPtrSize { signed: false }
     } else if let Some(TypeParams::One(p)) =
       is_v8_type(ty, "Local").and_then(get_type_params)
     {
@@ -536,7 +561,7 @@ impl<'tu> From<Type<'tu>> for SigType<'tu> {
     {
       M::MaybeLocal(get_type_name(p).unwrap())
     } else if let Some(pty) = is_v8_type_pointee(ty, "Isolate") {
-      M::Isolate {
+      M::IsolatePtr {
         mutable: !pty.is_const_qualified(),
       }
     } else if let Some(pty) = is_v8_type(ty, "StartupData") {
@@ -555,7 +580,7 @@ impl<'tu> From<Type<'tu>> for SigType<'tu> {
         })
         .and_then(get_type_name)
         .unwrap();
-      M::CallbackInfo { name, ret_ty_name }
+      M::CallbackInfoPtr { name, ret_ty_name }
     } else {
       M::Unknown(ty)
     }
@@ -569,81 +594,13 @@ impl<'tu> SigType<'tu> {
       _ => false,
     }
   }
-}
 
-fn visit_type<'tu>(
-  defs: &'_ mut ClassDefIndex<'tu>,
-  ty: Type<'tu>,
-  id: SigIdent,
-) -> Option<(SigIdent, SigType<'tu>)> {
-  use SigType as M;
-  use TypeKind as K;
-
-  let ty_map = if ty.get_kind() == K::Void {
-    M::Void
-  } else if ty.get_kind() == K::Bool {
-    M::Bool
-  } else if ty.get_kind() == K::Int {
-    M::Int { signed: true }
-  } else if is_std_type(ty, "int32_t") {
-    M::FixedInt {
-      bits: 32,
-      signed: true,
+  fn is_void_ptr(&self) -> bool {
+    match self {
+      Self::VoidPtr { .. } => true,
+      _ => false,
     }
-  } else if is_std_type(ty, "int64_t") {
-    M::FixedInt {
-      bits: 64,
-      signed: true,
-    }
-  } else if is_std_type(ty, "uint32_t") {
-    M::FixedInt {
-      bits: 32,
-      signed: false,
-    }
-  } else if is_std_type(ty, "uint64_t") {
-    M::FixedInt {
-      bits: 64,
-      signed: false,
-    }
-  } else if is_std_type(ty, "ssize_t") || is_std_type(ty, "intptr_t") {
-    M::IntPtr { signed: true }
-  } else if is_std_type(ty, "size_t") || is_std_type(ty, "uintptr_t") {
-    M::IntPtr { signed: false }
-  } else if let Some(TypeParams::One(p)) =
-    is_v8_type(ty, "Local").and_then(get_type_params)
-  {
-    M::Local(get_type_name(p).unwrap())
-  } else if let Some(TypeParams::One(p)) =
-    is_v8_type(ty, "MaybeLocal").and_then(get_type_params)
-  {
-    M::MaybeLocal(get_type_name(p).unwrap())
-  } else if let Some(pty) = is_v8_type_pointee(ty, "Isolate") {
-    M::Isolate {
-      mutable: !pty.is_const_qualified(),
-    }
-  } else if let Some(pty) = is_v8_type(ty, "StartupData") {
-    M::StartupData {
-      mutable: !pty.is_const_qualified(),
-    }
-  } else if let Some(ty2) = is_v8_type_pointee(ty, "FunctionCallbackInfo")
-    .or_else(|| is_v8_type_pointee(ty, "PropertyCallbackInfo"))
-  {
-    let name = get_type_name(ty2).unwrap();
-    let ret_ty_name = get_type_params(ty2)
-      .and_then(|ps| match ps {
-        TypeParams::Zero => None,
-        TypeParams::One(p) if is_void_type(p) => None,
-        TypeParams::One(p) => Some(p),
-        _ => panic!(),
-      })
-      .and_then(get_type_name)
-      .unwrap();
-    M::CallbackInfo { name, ret_ty_name }
-  } else {
-    M::Unknown(ty)
-    //return None;
-  };
-  Some((id, ty_map))
+  }
 }
 
 fn visit_callback_definition<'tu>(
@@ -658,7 +615,7 @@ fn visit_callback_definition<'tu>(
     .filter(|c| c.get_kind() == EntityKind::ParmDecl)
     .map(|c| c.get_name());
   let arg_tys = fn_ty.get_argument_types()?;
-  let sigs = once(Sig::returns(ret_ty))
+  let sigs = once(Sig::return_value(ret_ty))
     .chain(arg_names.into_iter().zip(arg_tys).map(Sig::from))
     .collect();
   Some(sigs)
