@@ -32,6 +32,7 @@ trait CxxCallback<F = Self>: UnitType {
 
 // *** MyCallback ***
 
+#[cfg(all(windows, target_arch = "x86_64"))]
 pub trait MyCallback:
   UnitType
   + for<'a> FnOnce(
@@ -41,6 +42,7 @@ pub trait MyCallback:
   ) -> Local<'a, Value>
 {
 }
+
 impl<F> MyCallback for F where
   F: UnitType
     + for<'a> FnOnce(
@@ -52,7 +54,7 @@ impl<F> MyCallback for F where
 }
 
 #[macro_export]
-macro_rules! impl_my_callback {
+macro_rules! impl_fn_my_callback {
   () => {
     impl MyCallback
       + for<'a> FnOnce(
@@ -63,6 +65,14 @@ macro_rules! impl_my_callback {
   };
 }
 
+#[cfg(target_family = "unix")]
+type CxxMyCallback = for<'a> extern "C" fn(
+  *mut Isolate,
+  Local<'a, Value>,
+  i32,
+) -> Local<'a, Value>;
+
+#[cfg(all(target_family = "windows", target_arch = "x86_64"))]
 type CxxMyCallback = for<'a> extern "C" fn(
   *mut Local<'a, Value>,
   *mut Isolate,
@@ -84,6 +94,17 @@ impl<F: MyCallback> CxxCallback for F {
       (F::get())(hs, a, b)
     }
 
+    #[cfg(target_family = "unix")]
+    #[inline(always)]
+    extern "C" fn abi_adapter<'a, F: MyCallback>(
+      isolate: *mut Isolate,
+      a: Local<'a, Value>,
+      b: i32,
+    ) -> Local<'a, Value> {
+      signature_adapter::<F>(isolate, a, b)
+    }
+
+    #[cfg(all(target_family = "windows", target_arch = "x86_64"))]
     #[inline(always)]
     extern "C" fn abi_adapter<'a, F: MyCallback>(
       ret: *mut Local<'a, Value>,
@@ -115,7 +136,7 @@ mod my_callback_test {
 
     let _ = pass_to_fn_as_type_param(&callback);
     let _ = pass_to_fn_as_impl_trait(callback);
-    let _ = pass_to_fn_as_impl_trait_fn_once(callback);
+    let _ = pass_to_fn_as_impl_fn_trait(callback);
 
     // Rust apparently does not use all information available from supertraits.
     // It can't deduce the proper lifetime for a closure return value from a
@@ -127,7 +148,7 @@ mod my_callback_test {
     // infer the correct lifetimes. As replicating that complicated type in
     // many places is error prone and hurts readability, this crate exports
     // a macro that produces the full `impl FnOnce( ... ) -> ...` impl trait.
-    let _ = pass_to_fn_as_impl_trait_fn_once(|_, a, _| a);
+    let _ = pass_to_fn_as_impl_fn_trait(|_, a, _| a);
   }
 
   fn pass_to_fn_as_type_param<F: MyCallback>(
@@ -140,7 +161,7 @@ mod my_callback_test {
     f.cxx_fn_from_val()
   }
 
-  fn pass_to_fn_as_impl_trait_fn_once(f: impl_my_callback!()) -> CxxMyCallback {
+  fn pass_to_fn_as_impl_fn_trait(f: impl_fn_my_callback!()) -> CxxMyCallback {
     f.cxx_fn_from_val()
   }
 }
