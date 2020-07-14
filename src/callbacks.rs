@@ -3,11 +3,15 @@
 use clang::*;
 use linked_hash_map::LinkedHashMap;
 use linked_hash_set::LinkedHashSet;
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fmt::{self, Display, Formatter};
 use std::hash::Hash;
 use std::iter::once;
 use std::iter::IntoIterator;
 use std::vec;
+
+type CallbackIndex<'tu> = HashMap<Entity<'tu>, String>;
 
 fn get_single_base_class(e: Entity) -> Option<Entity> {
   let mut it = e
@@ -298,7 +302,7 @@ enum SigType<'tu> {
   Isolate {
     disposition: Disposition,
   },
-  ContextScope {
+  CallbackScope {
     param: String,
   },
   StartupData {
@@ -356,7 +360,7 @@ impl<'tu> Display for SigType<'tu> {
         disposition.fmt(f)?;
         write!(f, "Isolate")
       }
-      Self::ContextScope { .. } => write!(f, "&mut ContextScope<'s>"),
+      Self::CallbackScope { .. } => write!(f, "&mut CallbackScope<'s>"),
       Self::Local { inner_ty_name, .. } => {
         write!(f, "Local<'s, {}>", inner_ty_name)
       }
@@ -380,7 +384,7 @@ impl<'tu> Display for SigType<'tu> {
       }
       Self::CallbackArguments { ty_name, .. } => write!(f, "{}<'s>", ty_name),
       Self::CallbackReturnValue { ret_ty_name, .. } => {
-        write!(f, "mut ReturnValue<'s /*, {} */>", ret_ty_name)
+        write!(f, "ReturnValue<'s /*, {} */>", ret_ty_name)
       }
       Self::Unknown(u) => write!(f, "{:?}", u),
     }
@@ -411,7 +415,7 @@ impl<'tu> Sig<'tu> {
     raw: bool,
   ) {
     match self.ty {
-      SigType::ContextScope { .. }
+      SigType::CallbackScope { .. }
       | SigType::Local { .. }
       | SigType::MaybeLocal { .. }
       | SigType::PromiseRejectMessage
@@ -442,9 +446,16 @@ impl<'tu> Sig<'tu> {
     }
   }
 
-  fn needs_win64_stack_return_fix(&self) -> bool {
-    match self.ty {
-      SigType::Local { .. } | SigType::MaybeLocal { .. } => true,
+  pub fn is_return_value_that_requires_win64_stack_return_fix(&self) -> bool {
+    match self {
+      Sig {
+        id: SigIdent::Return,
+        ty: SigType::Local { .. },
+      }
+      | Sig {
+        id: SigIdent::Return,
+        ty: SigType::MaybeLocal { .. },
+      } => true,
       _ => false,
     }
   }
@@ -456,6 +467,8 @@ impl<'tu> Sig<'tu> {
     win64_stack_return_fix: bool,
     with_types: bool,
     with_names: bool,
+    closure_style: bool,
+    used_inputs: Option<&HashSet<String>>,
   ) -> String
   where
     R: Iterator<Item = Sig<'tu>>,
@@ -470,17 +483,26 @@ impl<'tu> Sig<'tu> {
             win64_stack_return_fix,
             with_types,
             with_names,
+            closure_style,
+            used_inputs,
           )
         })
         .unwrap_or_default()
     };
     let fmt_separator = || if with_names && with_types { ": " } else { "" };
+    let fmt_name_prefix = |v| {
+      used_inputs
+        .as_ref()
+        .filter(|u| !u.contains(v))
+        .map(|_| "_")
+        .unwrap_or("")
+    };
     let fmt_name = |v| {
       if with_names {
         if raw {
-          format!("{:#}", v)
+          format!("{}{:#}", fmt_name_prefix(v), v)
         } else {
-          format!("{}", v)
+          format!("{}{}", fmt_name_prefix(v), v)
         }
       } else {
         Default::default()
@@ -499,8 +521,11 @@ impl<'tu> Sig<'tu> {
     };
     use SigIdent as I;
     match self {
-      Sig { id: I::Return, .. } if !with_types => {
+      Sig { id: I::Return, .. } if !with_types && !closure_style => {
         format!("({})", gen_rest(rest))
+      }
+      Sig { id: I::Return, .. } if !with_types && closure_style => {
+        format!("|{}|", gen_rest(rest))
       }
       Sig { id: I::Return, ty }
         if raw && !with_names && win64_stack_return_fix =>
@@ -542,20 +567,70 @@ impl<'tu> Sig<'tu> {
     }
   }
 
-  fn generate_raw_to_native_conversions<R>(&self, rest: R) -> String
+  fn gather_raw_to_native_conversion_used_inputs<R>(
+    self,
+    mut rest: R,
+    used_inputs: &mut HashSet<String>,
+  ) where
+    R: Iterator<Item = Sig<'tu>>,
+  {
+    match self {
+      Sig {
+        ty: SigType::CallbackScope { param },
+        ..
+      } => {
+        used_inputs.insert(param);
+      }
+      Sig {
+        ty: SigType::CallbackArguments { info_var_name, .. },
+        ..
+      }
+      | Sig {
+        ty: SigType::CallbackReturnValue { info_var_name, .. },
+        ..
+      } => {
+        used_inputs.insert(info_var_name);
+      }
+      Sig {
+        id: SigIdent::Param(Some(name)),
+        ..
+      } => {
+        used_inputs.insert(name);
+      }
+      _ => {}
+    }
+    if let Some(next) = rest.next() {
+      next.gather_raw_to_native_conversion_used_inputs(rest, used_inputs);
+    }
+  }
+
+  fn gather_raw_to_native_conversions<R>(&self, rest: R) -> String
   where
     R: Iterator<Item = Sig<'tu>>,
   {
     let gen_rest = |mut rest: R| {
       let next = rest.next();
       next
-        .map(|n| n.generate_raw_to_native_conversions(rest))
+        .map(|n| n.gather_raw_to_native_conversions(rest))
         .unwrap_or_default()
     };
     match self {
       Sig {
         id: SigIdent::Param(Some(name)),
-        ty: SigType::ContextScope { param },
+        ty: SigType::Isolate { disposition },
+      } => {
+        assert_ne!(disposition, &Disposition::Owned);
+        format!(
+          "  let {} = unsafe {{ {}*{} }};\n{}",
+          name,
+          disposition,
+          name,
+          gen_rest(rest)
+        )
+      }
+      Sig {
+        id: SigIdent::Param(Some(name)),
+        ty: SigType::CallbackScope { param },
       } => format!(
         "  let {} = &mut unsafe {{ CallbackScope::new({}) }};\n{}",
         name,
@@ -587,7 +662,7 @@ impl<'tu> Sig<'tu> {
             info_var_name,
           },
       } => format!(
-        "  let mut {} = ReturnValue:/*:<{}>:*/:from_{}({});\n{}",
+        "  let {} /* <{}> */ = ReturnValue::from_{}({});\n{}",
         name,
         ret_ty_name,
         to_snake_case(info_ty_name),
@@ -768,7 +843,7 @@ fn generate_angle_bracket_params<'tu>(
   with_type_params: bool,
   include_unconstrained: bool,
   include_constraints: bool,
-  wrap_fn: Option<impl Fn(String) -> String>,
+  wrap_fn: impl Fn(String) -> String,
 ) -> String {
   let mut map = LinkedHashMap::<String, LinkedHashSet<String>>::new();
   if with_lifetimes {
@@ -802,9 +877,10 @@ fn generate_angle_bracket_params<'tu>(
       .collect::<Vec<_>>()
       .join(", ")
   };
-  match wrap_fn {
-    Some(f) if !s.is_empty() => f(s),
-    _ => s,
+  if !s.is_empty() {
+    wrap_fn(s)
+  } else {
+    s
   }
 }
 
@@ -814,6 +890,8 @@ fn generate_call_params<'tu>(
   win64_stack_return_fix: bool,
   with_types: bool,
   with_names: bool,
+  closure_style: bool,
+  used_inputs: Option<&HashSet<String>>,
 ) -> String {
   gather_recursively_with(sigs.to_owned(), |first, rest| {
     first.generate_call_signature(
@@ -822,13 +900,36 @@ fn generate_call_params<'tu>(
       win64_stack_return_fix,
       with_types,
       with_names,
+      closure_style,
+      used_inputs,
     )
   })
 }
 
-fn generate_raw_to_native_conversions<'tu>(sigs: &[Sig<'tu>]) -> String {
+fn contains_unknown_cxx_types<'tu>(sigs: &[Sig<'tu>]) -> bool {
+  sigs
+    .iter()
+    .find(|sig| match sig {
+      Sig {
+        ty: SigType::Unknown(_),
+        ..
+      } => true,
+      _ => false,
+    })
+    .is_some()
+}
+
+fn gather_raw_to_native_conversions<'tu>(sigs: &[Sig<'tu>]) -> String {
   gather_recursively_with(sigs.to_owned(), |first, rest| {
-    first.generate_raw_to_native_conversions(rest)
+    first.gather_raw_to_native_conversions(rest)
+  })
+}
+
+fn gather_used_inputs<'tu>(sigs_native: &[Sig<'tu>]) -> HashSet<String> {
+  gather_recursively_with(sigs_native.to_owned(), |first, rest| {
+    let mut used_inputs = HashSet::<String>::new();
+    first.gather_raw_to_native_conversion_used_inputs(rest, &mut used_inputs);
+    used_inputs
   })
 }
 
@@ -841,13 +942,6 @@ fn give_all_signature_params_a_name(sigs: Vec<Sig>) -> Vec<Sig> {
         ..
       } => sig,
       Sig {
-        id: SigIdent::Param(Some(name)),
-        ty,
-      } if name == "data" && ty.is_void_ptr() => Sig {
-        id: "embedder_context".into(),
-        ty,
-      },
-      Sig {
         id: SigIdent::Param(Some(..)),
         ..
       } => sig,
@@ -858,6 +952,7 @@ fn give_all_signature_params_a_name(sigs: Vec<Sig>) -> Vec<Sig> {
         id: match ty {
           SigType::Isolate { .. } => "isolate",
           SigType::CallbackInfo { .. } => "info",
+          SigType::Void { .. } => "callback_data",
           _ => "«?»",
         }
         .into(),
@@ -901,7 +996,7 @@ fn convert_raw_signature_to_native<'tu>(sigs: &[Sig<'tu>]) -> Vec<Sig<'tu>> {
       })
     })
     .map(|param| Sig {
-      ty: SigType::ContextScope { param },
+      ty: SigType::CallbackScope { param },
       id: "scope".into(),
     });
 
@@ -912,14 +1007,15 @@ fn convert_raw_signature_to_native<'tu>(sigs: &[Sig<'tu>]) -> Vec<Sig<'tu>> {
     .cloned()
     .flat_map(move |sig| match sig {
       // Keep the return type at the beginning of the list.
-      // Insert the ContextScope (if any) right after the return type.
+      // Insert the CallbackScope (if any) right after the return type.
       Sig {
         id: SigIdent::Return,
         ..
       } => once(sig).chain(scope_param.take().into_iter()),
       _ => once(sig).chain(None.into_iter()),
     })
-    .filter(|sig| match sig {
+    .filter(
+      |sig| match sig {
         // Remove any `Isolate` and `Local<Context>` parameters if we are passing
         // a scope.
         Sig {
@@ -927,14 +1023,11 @@ fn convert_raw_signature_to_native<'tu>(sigs: &[Sig<'tu>]) -> Vec<Sig<'tu>> {
           ..
         } => false,
         Sig {
-          ty: SigType::Local {
-            inner_ty, ..
-          },
+          ty: SigType::Local { inner_ty, .. },
           id: SigIdent::Param(..),
         } if type_has_base_class_in_v8_ns(inner_ty, "Context") => false,
-        _ =>   true,
-      }
-      || !has_scope
+        _ => true,
+      } || !has_scope
     )
     .flat_map(|sig| match sig {
       // Split Function/PropertyCallbackInfo into 'arguments' and, if
@@ -976,120 +1069,281 @@ fn convert_raw_signature_to_native<'tu>(sigs: &[Sig<'tu>]) -> Vec<Sig<'tu>> {
     .collect::<Vec<_>>()
 }
 
+fn return_value_requires_win64_stack_return_fix<'tu>(
+  sigs: &[Sig<'tu>],
+) -> bool {
+  sigs
+    .iter()
+    .find(|sig| sig.is_return_value_that_requires_win64_stack_return_fix())
+    .is_some()
+}
+
 fn render_callback_definition<'tu>(
   cb_name: &str,
   sigs_native: &[Sig<'tu>],
   sigs_raw: &[Sig<'tu>],
+  used_inputs: HashSet<String>,
+  use_win64fix: bool,
 ) {
-  let s = format!(
+  let cb_name_uc = cb_name;
+  let cb_name_lc = to_snake_case(&cb_name);
+  let for_lifetimes_native = generate_angle_bracket_params(
+    sigs_native,
+    false,
+    true,
+    false,
+    true,
+    false,
+    |s| format!("for<{}> ", s),
+  );
+  let lifetimes_native = generate_angle_bracket_params(
+    sigs_native,
+    false,
+    true,
+    false,
+    true,
+    false,
+    |s| s,
+  );
+  let for_lifetimes_raw = generate_angle_bracket_params(
+    sigs_raw,
+    true,
+    true,
+    false,
+    true,
+    false,
+    |s| format!("for<{}> ", s),
+  );
+  let lifetimes_raw_comma = generate_angle_bracket_params(
+    sigs_raw,
+    true,
+    true,
+    false,
+    true,
+    false,
+    |s| format!("{}, ", s),
+  );
+  let call_param_types_native =
+    generate_call_params(sigs_native, false, false, true, false, false, None);
+  let call_param_types_raw =
+    generate_call_params(sigs_raw, true, false, true, false, false, None);
+  let call_param_types_raw_win64fix =
+    generate_call_params(sigs_raw, true, true, true, false, false, None);
+  let call_param_names_native =
+    generate_call_params(sigs_native, false, false, false, true, false, None);
+  let call_param_names_native_closure_notused = generate_call_params(
+    sigs_native,
+    false,
+    false,
+    false,
+    true,
+    true,
+    Some(&Default::default()),
+  );
+  let call_param_names_raw = generate_call_params(
+    sigs_raw,
+    true,
+    false,
+    false,
+    true,
+    false,
+    Some(&used_inputs),
+  );
+  let call_params_full_native_notused = generate_call_params(
+    sigs_native,
+    false,
+    false,
+    true,
+    true,
+    false,
+    Some(&Default::default()),
+  );
+  let call_params_full_raw = generate_call_params(
+    sigs_raw,
+    true,
+    false,
+    true,
+    true,
+    false,
+    Some(&used_inputs),
+  );
+  let call_params_full_raw_win64fix = generate_call_params(
+    sigs_raw,
+    true,
+    true,
+    true,
+    true,
+    false,
+    Some(&used_inputs),
+  );
+  let raw_to_native_conversions = gather_raw_to_native_conversions(sigs_native);
+
+  let common_code = format!(
     r#"
 // *** {cb_name_uc} ***
 
 pub trait {cb_name_uc}:
   UnitType
-  + {for_lifetimes_native}FnOnce{call_param_types_native}
+  + {for_lifetimes_native}Fn{call_param_types_native}
 {{
 }}
 
 impl<F> {cb_name_uc} for F where
   F: UnitType
-    + {for_lifetimes_native}FnOnce{call_param_types_native}
+    + {for_lifetimes_native}Fn{call_param_types_native}
 {{
 }}
 
 #[macro_export]
-macro_rules! impl_fn_{cb_name_lc} {{
+macro_rules! impl_{cb_name_lc} {{
   () => {{
 impl {cb_name_uc}
-  + {for_lifetimes_native}FnOnce{call_param_types_native}
+  + {for_lifetimes_native}Fn{call_param_types_native}
   }};
 }}
 
+struct {cb_name_uc}Tag;
+"#,
+    cb_name_uc = cb_name_uc,
+    cb_name_lc = cb_name_lc,
+    for_lifetimes_native = for_lifetimes_native,
+    call_param_types_native = call_param_types_native,
+  );
+
+  let test_code = format!(
+    r#"
+#[cfg(test)]
+fn {cb_name_lc}_mock<{lifetimes_native}>{call_params_full_native_notused} {{
+  unimplemented!()
+}}
+
+#[test]
+fn {cb_name_lc}_as_type_param() {{
+  fn pass_as_type_param<F: {cb_name_uc}>(_: F) -> <F as CxxCallback<{cb_name_uc}Tag>>::CxxFn {{
+    F::cxx_fn()
+  }}
+  let _ = pass_as_type_param({cb_name_lc}_mock);
+  let _ = pass_as_type_param(&{cb_name_lc}_mock);
+}}
+
+#[test]
+fn {cb_name_lc}_as_impl_trait() {{
+  fn pass_as_impl_trait(f: impl {cb_name_uc}) -> Cxx{cb_name_uc} {{
+    f.cxx_fn_from_val()
+  }}
+  let _ = pass_as_impl_trait({cb_name_lc}_mock);
+  let _ = pass_as_impl_trait(&{cb_name_lc}_mock);
+}}
+
+#[test]
+fn {cb_name_lc}_as_impl_with_macro() {{
+  fn pass_as_impl_with_macro(f: impl_{cb_name_lc}!()) -> Cxx{cb_name_uc} {{
+    f.cxx_fn_from_val()
+  }}
+  let _ = pass_as_impl_with_macro({cb_name_lc}_mock);
+  let _ = pass_as_impl_with_macro({call_param_names_native_closure_notused} unimplemented!());
+}}
+"#,
+    cb_name_uc = cb_name_uc,
+    cb_name_lc = cb_name_lc,
+    lifetimes_native = lifetimes_native,
+    call_param_names_native_closure_notused =
+      call_param_names_native_closure_notused,
+    call_params_full_native_notused = call_params_full_native_notused
+  );
+
+  let abi_specific_code = if !use_win64fix {
+    format!(
+      r#"
+type Cxx{cb_name_uc} = {for_lifetimes_raw}extern "C" fn{call_param_types_raw};
+
+impl<F: {cb_name_uc}> CxxCallback<{cb_name_uc}Tag> for F {{
+  type CxxFn = Cxx{cb_name_uc};
+
+  fn cxx_fn() -> Self::CxxFn {{
+    #[inline(always)]
+    extern "C" fn adapter<{lifetimes_raw_comma}F: {cb_name_uc}>{call_params_full_raw} {{
+      {raw_to_native_conversions}
+      (F::get()){call_param_names_native}
+    }}
+
+    adapter::<F>
+  }}
+}}
+"#,
+      cb_name_uc = cb_name_uc,
+      for_lifetimes_raw = for_lifetimes_raw,
+      lifetimes_raw_comma = lifetimes_raw_comma,
+      call_param_types_raw = call_param_types_raw,
+      call_param_names_native = call_param_names_native,
+      call_params_full_raw = call_params_full_raw,
+      raw_to_native_conversions = raw_to_native_conversions,
+    )
+  } else {
+    format!(
+      r#"
 #[cfg(target_family = "unix")]
 type Cxx{cb_name_uc} = {for_lifetimes_raw}extern "C" fn{call_param_types_raw};
 
 #[cfg(all(target_family = "windows", target_arch = "x86_64"))]
 type Cxx{cb_name_uc} = {for_lifetimes_raw}extern "C" fn{call_param_types_raw_win64fix};
 
-impl<F: {cb_name_uc}> CxxCallback for F {{
+impl<F: {cb_name_uc}> CxxCallback<{cb_name_uc}Tag> for F {{
   type CxxFn = Cxx{cb_name_uc};
 
   fn cxx_fn() -> Self::CxxFn {{
     #[inline(always)]
-    fn signature_adapter<{lifetimes_raw_comma}F: MyCallback>{call_params_full_raw} {{
+    fn signature_adapter<{lifetimes_raw_comma}F: {cb_name_uc}>{call_params_full_raw} {{
       {raw_to_native_conversions}
       (F::get()){call_param_names_native}
     }}
 
     #[cfg(target_family = "unix")]
     #[inline(always)]
-    extern "C" fn abi_adapter<'a, F: MyCallback>{call_params_full_raw} {{
+    extern "C" fn abi_adapter<'a, F: {cb_name_uc}>{call_params_full_raw} {{
       signature_adapter::<F>{call_param_names_raw}
     }}
 
     #[cfg(all(target_family = "windows", target_arch = "x86_64"))]
     #[inline(always)]
-    extern "C" fn abi_adapter<{lifetimes_raw_comma}F: MyCallback>{call_params_full_raw_win64fix} {{
-      unsafe {{ ptr::write(return_value, signature_adapter::<F>{call_params_full_raw}) }};
-      return_value
+    extern "C" fn abi_adapter<{lifetimes_raw_comma}F: {cb_name_uc}>{call_params_full_raw_win64fix} {{
+      unsafe {{
+        ptr::write(return_value, signature_adapter::<F>{call_param_names_raw});
+        return_value
+      }}
     }}
 
     abi_adapter::<F>
   }}
 }}
-  "#,
-    cb_name_uc = cb_name,
-    cb_name_lc = to_snake_case(&cb_name),
-    for_lifetimes_native = generate_angle_bracket_params(
-      sigs_native,
-      false,
-      true,
-      false,
-      true,
-      false,
-      Some(|s| format!("for<{}> ", s))
-    ),
-    for_lifetimes_raw = generate_angle_bracket_params(
-      sigs_raw,
-      true,
-      true,
-      false,
-      true,
-      false,
-      Some(|s| format!("for<{}> ", s))
-    ),
-    lifetimes_raw_comma = generate_angle_bracket_params(
-      sigs_raw,
-      true,
-      true,
-      false,
-      true,
-      false,
-      Some(|s| format!("{}, ", s))
-    ),
-    call_param_types_native =
-      generate_call_params(sigs_native, false, false, true, false),
-    call_param_types_raw =
-      generate_call_params(sigs_raw, true, false, true, false),
-    call_param_types_raw_win64fix =
-      generate_call_params(sigs_raw, true, true, true, false),
-    call_param_names_native =
-      generate_call_params(sigs_native, false, false, false, true),
-    call_param_names_raw =
-      generate_call_params(sigs_raw, true, false, false, true),
-    call_params_full_raw =
-      generate_call_params(sigs_raw, true, false, true, true),
-    call_params_full_raw_win64fix =
-      generate_call_params(sigs_raw, true, true, true, true),
-    raw_to_native_conversions = generate_raw_to_native_conversions(sigs_native)
+"#,
+      cb_name_uc = cb_name_uc,
+      for_lifetimes_raw = for_lifetimes_raw,
+      lifetimes_raw_comma = lifetimes_raw_comma,
+      call_param_types_raw = call_param_types_raw,
+      call_param_types_raw_win64fix = call_param_types_raw_win64fix,
+      call_param_names_native = call_param_names_native,
+      call_param_names_raw = call_param_names_raw,
+      call_params_full_raw = call_params_full_raw,
+      call_params_full_raw_win64fix = call_params_full_raw_win64fix,
+      raw_to_native_conversions = raw_to_native_conversions,
+    )
+  };
+
+  let code = format!(
+    "{common_code}\n{abi_specific_code}\n{test_code}",
+    common_code = common_code,
+    abi_specific_code = abi_specific_code,
+    test_code = test_code,
   );
-  println!("{}", s);
+
+  println!("{}", code);
 }
 
 fn visit_callback_definition<'tu>(
   e: Entity<'tu>,   // The typedef definition node.
   fn_ty: Type<'tu>, // The callback function prototype.
-) -> Option<Vec<Sig<'tu>>> {
+) -> Option<()> {
   let cb_name = get_flat_name_for_callback_type(e);
   let ret_ty = fn_ty.get_result_type()?;
   let arg_names = e
@@ -1103,11 +1357,24 @@ fn visit_callback_definition<'tu>(
     .collect();
   let sigs_raw = give_all_signature_params_a_name(sigs_raw);
   let sigs_native = convert_raw_signature_to_native(&sigs_raw);
-  render_callback_definition(&cb_name, &sigs_native, &sigs_raw);
-  None
+  let used_inputs = gather_used_inputs(&sigs_native);
+  let use_win64fix = return_value_requires_win64_stack_return_fix(&sigs_raw);
+  if !contains_unknown_cxx_types(&sigs_raw) {
+    render_callback_definition(
+      &cb_name,
+      &sigs_native,
+      &sigs_raw,
+      used_inputs,
+      use_win64fix,
+    );
+  }
+  Some(())
 }
 
-fn visit_declaration<'tu>(e: Entity<'tu>) -> Option<()> {
+fn visit_declaration<'tu>(
+  _index: &mut CallbackIndex<'tu>,
+  e: Entity<'tu>,
+) -> Option<()> {
   if e.is_definition() {
     if let Some(ty) = e.get_typedef_underlying_type() {
       if ty.get_kind() == TypeKind::Pointer {
@@ -1124,10 +1391,10 @@ fn visit_declaration<'tu>(e: Entity<'tu>) -> Option<()> {
   Some(())
 }
 
-fn visit_v8_ns<'tu>(ns: Entity<'tu>) {
+fn visit_v8_ns<'tu>(index: &mut CallbackIndex<'tu>, ns: Entity<'tu>) {
   ns.visit_children(|e, _| {
     if e.is_declaration() {
-      visit_declaration(e);
+      visit_declaration(index, e);
       EntityVisitResult::Recurse
     } else {
       EntityVisitResult::Continue
@@ -1137,10 +1404,11 @@ fn visit_v8_ns<'tu>(ns: Entity<'tu>) {
 
 fn visit_translation_unit<'tu>(translation_unit: &'tu TranslationUnit<'tu>) {
   let root = translation_unit.get_entity();
+  let mut index = CallbackIndex::new();
   root.visit_children(|e, _| {
     if e.get_kind() == EntityKind::Namespace {
       if is_v8_ns(e) {
-        visit_v8_ns(e);
+        visit_v8_ns(&mut index, e);
       }
       EntityVisitResult::Continue
     } else {
@@ -1150,13 +1418,115 @@ fn visit_translation_unit<'tu>(translation_unit: &'tu TranslationUnit<'tu>) {
 }
 
 pub fn generate(tu: &TranslationUnit) {
-  visit_translation_unit(tu);
   println!("{}", boilerplate());
+  visit_translation_unit(tu);
 }
 
 fn boilerplate() -> &'static str {
   r#"
 // Copyright 2019-2020 the Deno authors. All rights reserved. MIT license.
+
+//! # Why these `impl_some_callback!()` macros?
+//! 
+//! It appears that Rust is unable to use information that is available from
+//! super traits for type and/or lifetime inference purposes. This causes it to
+//! rejects well formed closures for no reason at all. These macros provide
+//! a workaround for this issue. 
+//!
+//! ```rust,ignore
+//! // First, require that *all* implementors of `MyCallback` also implement a
+//! // `Fn(...)` supertrait.
+//! trait MyCallback: Sized + for<'a> Fn(&'a u32) -> &'a u32 {}
+//!
+//! // Povide a blanket `MyCallback` impl for all compatible types. This makes
+//! // `MyCallback` essentially an alias of `Fn(&u32) -> &u32`.
+//! impl<F> MyCallback for F where F: Sized + for<'a> Fn(&'a u32) -> &'a u32 {}
+//! 
+//! // Define two functions with a parameter of the trait we just defined.
+//! // One function uses the shorthand 'MyCallback', the other uses exactly the
+//! // same `for<'a> Fn(...)` notation as we did when specifying the supertrait.
+//! fn do_this(callback: impl MyCallback) {
+//!   let val = 123u32;
+//!   let _ = callback(&val);
+//! }
+//! fn do_that(callback: impl for<'a> Fn(&'a u32) -> &'a u32) {
+//!   let val = 456u32;
+//!   let _ = callback(&val);
+//! }
+//! 
+//! // Both of the above functions will accept an ordinary function (with a
+//! // matching signature) as the only argument.
+//! fn test_cb(a: &u32) -> &u32 { a }
+//! do_this(test_cb);   // Ok!
+//! do_that(test_cb);   // Ok!
+//! 
+//! // However, when attempting to do the same with a closure, Rust loses it
+//! // as it tries to reconcile the type of the closure with `impl MyCallback`.
+//! do_this(|a| a);     // "Type mismatch resolving..."
+//! do_that(|a| a);     // Ok!
+//! 
+//! // Note that even when we explicitly define the closure's argument and
+//! // return types, the Rust compiler still wants nothing to do with it...
+//! //   ⚠ Type mismatch resolving
+//! //   ⚠ `for<'a> <[closure] as FnOnce<(&'a u32,)>>::Output == &'a u32`.
+//! //   ⚠ Expected bound lifetime parameter 'a, found concrete lifetime.
+//! do_this(|a: &u32| -> &u32 { a });
+//! 
+//! // The function signature used in this example is short and simple, but
+//! // real world `Fn` traits tend to get long and complicated. These macros
+//! // are there to make closure syntax possible without replicating the full
+//! // `Fn(...)` trait definition over and over again.
+//! macro_rules! impl_my_callback {
+//!   () => {
+//!     impl MyCallback + for<'a> Fn(&'a u32) -> &'a u32
+//!   };
+//! }
+//! 
+//! // It lets us define a function with a `MyCallback` parameter as follows:
+//! fn do_such(callback: impl_my_callback!()) {
+//!   let val = 789u32;
+//!   let _ = callback(&val);
+//! }
+//! 
+//! // And, as expected, we can pass either a function or a closure for the
+//! // first argument.
+//! do_such(test_cb);   // Ok!
+//! do_such(|a| a);     // Ok!
+//! ```
+
+#![allow(clippy::needless_lifetimes)]
+
+use std::ffi::c_void;
+use std::ptr;
+
+use crate::scope::CallbackScope;
+use crate::support::int;
+use crate::support::UnitType;
+use crate::Array;
+use crate::Context;
+use crate::FunctionCallbackArguments;
+use crate::FunctionCallbackInfo;
+use crate::Isolate;
+use crate::Local;
+use crate::Message;
+use crate::Module;
+use crate::Name;
+use crate::Object;
+use crate::Promise;
+use crate::PropertyCallbackArguments;
+use crate::PropertyCallbackInfo;
+use crate::ReturnValue;
+use crate::ScriptOrModule;
+use crate::StartupData;
+use crate::Value;
+
+trait CxxCallback<Tag = ()>: UnitType {
+  type CxxFn;
+  fn cxx_fn() -> Self::CxxFn;
+  fn cxx_fn_from_val(&'_ self) -> Self::CxxFn {
+    Self::cxx_fn()
+  }
+}
 "#
   .trim()
 }

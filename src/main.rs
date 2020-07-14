@@ -25,6 +25,7 @@ fn main() {
       arg("-nostdinc++"),
       isystem("./buildtools/third_party/libc++/trunk/include"),
       isystem("./buildtools/third_party/libc++abi/trunk/include"),
+      arg("-DV8_IMMINENT_DEPRECATION_WARNINGS"),
     ])
     .parse()
     .unwrap();
