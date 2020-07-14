@@ -8,3 +8,5 @@ edition = "2018"
 
 [dependencies]
 clang = { version = "0.23.0", features = ["clang_8_0"] }
+linked-hash-map = "0.5.3"
+linked_hash_set = "0.1.3"
