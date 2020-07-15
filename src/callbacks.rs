@@ -372,21 +372,26 @@ impl<'tu> Display for SigType<'tu> {
         disposition.fmt(f)?;
         write!(f, "StartupData")
       }
-      Self::CallbackInfo {
-        ty_name,
-        ret_ty_name,
-      } => {
-        write!(f, "{:#}{}", Disposition::Const, ty_name)?;
-        if let Some(rtyn) = ret_ty_name {
-          write!(f, " /* <{}> */", rtyn)?;
-        }
-        Ok(())
+      Self::CallbackInfo { ty_name, .. } => {
+        write!(f, "{:#}{}", Disposition::Const, ty_name)
       }
       Self::CallbackArguments { ty_name, .. } => write!(f, "{}<'s>", ty_name),
       Self::CallbackReturnValue { ret_ty_name, .. } => {
-        write!(f, "ReturnValue<'s /*, {} */>", ret_ty_name)
+        write!(f, "ReturnValue<'s, {}>", ret_ty_name)
       }
-      Self::Unknown(u) => write!(f, "{:?}", u),
+      Self::Unknown(mut uty) => {
+        eprint!("XX ?? {:?}", uty);
+        while let Some(pty) = uty.get_pointee_type() {
+          Disposition::new_ptr(pty).fmt(f)?;
+          uty = pty;
+        }
+        eprintln!("  sizeof={:?}  sz[]={:?}", uty.get_sizeof(), uty.get_size());
+        write!(
+          f,
+          "{}??",
+          get_type_name(uty).unwrap_or_else(|| uty.get_display_name())
+        )
+      }
     }
   }
 }
@@ -662,7 +667,7 @@ impl<'tu> Sig<'tu> {
             info_var_name,
           },
       } => format!(
-        "  let {} /* <{}> */ = ReturnValue::from_{}({});\n{}",
+        "  let {} = ReturnValue::<{}>::from_{}({});\n{}",
         name,
         ret_ty_name,
         to_snake_case(info_ty_name),
@@ -746,10 +751,6 @@ impl<'tu> From<Type<'tu>> for SigType<'tu> {
       M::Isolate {
         disposition: Disposition::new_ptr(pty),
       }
-    } else if let Some(_ty) = is_v8_type(ty, "StartupData") {
-      M::StartupData {
-        disposition: Disposition::Owned,
-      }
     } else if let Some(ty2) = is_v8_type_pointee(ty, "FunctionCallbackInfo")
       .or_else(|| is_v8_type_pointee(ty, "PropertyCallbackInfo"))
     {
@@ -765,6 +766,12 @@ impl<'tu> From<Type<'tu>> for SigType<'tu> {
         ty_name,
         ret_ty_name,
       }
+    } else if let Some(_ty) = is_v8_type(ty, "StartupData") {
+      M::StartupData {
+        disposition: Disposition::Owned,
+      }
+    } else if let Some(_ty) = is_v8_type(ty, "PromiseRejectMessage") {
+      M::PromiseRejectMessage
     } else {
       M::Unknown(ty)
     }
@@ -1084,7 +1091,7 @@ fn render_callback_definition<'tu>(
   sigs_raw: &[Sig<'tu>],
   used_inputs: HashSet<String>,
   use_win64fix: bool,
-) {
+) -> String {
   let cb_name_uc = cb_name;
   let cb_name_lc = to_snake_case(&cb_name);
   let for_lifetimes_native = generate_angle_bracket_params(
@@ -1219,22 +1226,24 @@ fn {cb_name_lc}_mock<{lifetimes_native}>{call_params_full_native_notused} {{
 
 #[test]
 fn {cb_name_lc}_as_type_param() {{
-  fn pass_as_type_param<F: {cb_name_uc}>(_: F) -> <F as CxxCallback<{cb_name_uc}Tag>>::CxxFn {{
+  fn pass_as_type_param<F>(_: F) -> F::CxxFn
+  where F: {cb_name_uc} + CxxCallback<{cb_name_uc}Tag, CxxFn = Cxx{cb_name_uc}> {{
     F::cxx_fn()
-  }}
+  }} 
   let _ = pass_as_type_param({cb_name_lc}_mock);
   let _ = pass_as_type_param(&{cb_name_lc}_mock);
 }}
 
 #[test]
 fn {cb_name_lc}_as_impl_trait() {{
-  fn pass_as_impl_trait(f: impl {cb_name_uc}) -> Cxx{cb_name_uc} {{
+  fn pass_as_impl_trait(f: impl {cb_name_uc} + CxxCallback<{cb_name_uc}Tag, CxxFn = Cxx{cb_name_uc}>) -> Cxx{cb_name_uc} {{
     f.cxx_fn_from_val()
   }}
   let _ = pass_as_impl_trait({cb_name_lc}_mock);
   let _ = pass_as_impl_trait(&{cb_name_lc}_mock);
 }}
 
+/*
 #[test]
 fn {cb_name_lc}_as_impl_with_macro() {{
   fn pass_as_impl_with_macro(f: impl_{cb_name_lc}!()) -> Cxx{cb_name_uc} {{
@@ -1243,6 +1252,7 @@ fn {cb_name_lc}_as_impl_with_macro() {{
   let _ = pass_as_impl_with_macro({cb_name_lc}_mock);
   let _ = pass_as_impl_with_macro({call_param_names_native_closure_notused} unimplemented!());
 }}
+*/
 "#,
     cb_name_uc = cb_name_uc,
     cb_name_lc = cb_name_lc,
@@ -1337,7 +1347,14 @@ impl<F: {cb_name_uc}> CxxCallback<{cb_name_uc}Tag> for F {{
     test_code = test_code,
   );
 
-  println!("{}", code);
+  code
+}
+
+fn comment_out(code: String) -> String {
+  code
+    .lines()
+    .map(|s| format!("// {}\n", s))
+    .collect::<String>()
 }
 
 fn visit_callback_definition<'tu>(
@@ -1359,15 +1376,17 @@ fn visit_callback_definition<'tu>(
   let sigs_native = convert_raw_signature_to_native(&sigs_raw);
   let used_inputs = gather_used_inputs(&sigs_native);
   let use_win64fix = return_value_requires_win64_stack_return_fix(&sigs_raw);
-  if !contains_unknown_cxx_types(&sigs_raw) {
-    render_callback_definition(
-      &cb_name,
-      &sigs_native,
-      &sigs_raw,
-      used_inputs,
-      use_win64fix,
-    );
+  let mut code = render_callback_definition(
+    &cb_name,
+    &sigs_native,
+    &sigs_raw,
+    used_inputs,
+    use_win64fix,
+  );
+  if contains_unknown_cxx_types(&sigs_raw) {
+    code = comment_out(code);
   }
+  println!("{}", code);
   Some(())
 }
 
@@ -1427,11 +1446,11 @@ fn boilerplate() -> &'static str {
 // Copyright 2019-2020 the Deno authors. All rights reserved. MIT license.
 
 //! # Why these `impl_some_callback!()` macros?
-//! 
+//!
 //! It appears that Rust is unable to use information that is available from
 //! super traits for type and/or lifetime inference purposes. This causes it to
 //! rejects well formed closures for no reason at all. These macros provide
-//! a workaround for this issue. 
+//! a workaround for this issue.
 //!
 //! ```rust,ignore
 //! // First, require that *all* implementors of `MyCallback` also implement a
@@ -1441,7 +1460,7 @@ fn boilerplate() -> &'static str {
 //! // Povide a blanket `MyCallback` impl for all compatible types. This makes
 //! // `MyCallback` essentially an alias of `Fn(&u32) -> &u32`.
 //! impl<F> MyCallback for F where F: Sized + for<'a> Fn(&'a u32) -> &'a u32 {}
-//! 
+//!
 //! // Define two functions with a parameter of the trait we just defined.
 //! // One function uses the shorthand 'MyCallback', the other uses exactly the
 //! // same `for<'a> Fn(...)` notation as we did when specifying the supertrait.
@@ -1453,25 +1472,25 @@ fn boilerplate() -> &'static str {
 //!   let val = 456u32;
 //!   let _ = callback(&val);
 //! }
-//! 
+//!
 //! // Both of the above functions will accept an ordinary function (with a
 //! // matching signature) as the only argument.
 //! fn test_cb(a: &u32) -> &u32 { a }
 //! do_this(test_cb);   // Ok!
 //! do_that(test_cb);   // Ok!
-//! 
+//!
 //! // However, when attempting to do the same with a closure, Rust loses it
 //! // as it tries to reconcile the type of the closure with `impl MyCallback`.
 //! do_this(|a| a);     // "Type mismatch resolving..."
 //! do_that(|a| a);     // Ok!
-//! 
+//!
 //! // Note that even when we explicitly define the closure's argument and
 //! // return types, the Rust compiler still wants nothing to do with it...
 //! //   ⚠ Type mismatch resolving
 //! //   ⚠ `for<'a> <[closure] as FnOnce<(&'a u32,)>>::Output == &'a u32`.
 //! //   ⚠ Expected bound lifetime parameter 'a, found concrete lifetime.
 //! do_this(|a: &u32| -> &u32 { a });
-//! 
+//!
 //! // The function signature used in this example is short and simple, but
 //! // real world `Fn` traits tend to get long and complicated. These macros
 //! // are there to make closure syntax possible without replicating the full
@@ -1481,13 +1500,13 @@ fn boilerplate() -> &'static str {
 //!     impl MyCallback + for<'a> Fn(&'a u32) -> &'a u32
 //!   };
 //! }
-//! 
+//!
 //! // It lets us define a function with a `MyCallback` parameter as follows:
 //! fn do_such(callback: impl_my_callback!()) {
 //!   let val = 789u32;
 //!   let _ = callback(&val);
 //! }
-//! 
+//!
 //! // And, as expected, we can pass either a function or a closure for the
 //! // first argument.
 //! do_such(test_cb);   // Ok!
@@ -1503,9 +1522,11 @@ use crate::scope::CallbackScope;
 use crate::support::int;
 use crate::support::UnitType;
 use crate::Array;
+use crate::Boolean;
 use crate::Context;
 use crate::FunctionCallbackArguments;
 use crate::FunctionCallbackInfo;
+use crate::Integer;
 use crate::Isolate;
 use crate::Local;
 use crate::Message;
@@ -1513,6 +1534,7 @@ use crate::Module;
 use crate::Name;
 use crate::Object;
 use crate::Promise;
+use crate::PromiseRejectMessage;
 use crate::PropertyCallbackArguments;
 use crate::PropertyCallbackInfo;
 use crate::ReturnValue;
