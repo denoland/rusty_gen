@@ -1360,7 +1360,7 @@ impl<F> From<F> for {cb_name_uc}
 
     #[cfg(target_family = "unix")]
     #[inline(always)]
-    extern "C" fn abi_adapter<'a, F: Into{cb_name_uc}>{call_params_full_raw} {{
+    extern "C" fn abi_adapter<{lifetimes_raw_comma}F: Into{cb_name_uc}>{call_params_full_raw} {{
       signature_adapter::<F>{call_param_names_raw}
     }}
 
@@ -1368,7 +1368,7 @@ impl<F> From<F> for {cb_name_uc}
     #[inline(always)]
     extern "C" fn abi_adapter<{lifetimes_raw_comma}F: Into{cb_name_uc}>{call_params_full_raw_win64fix} {{
       unsafe {{
-        ptr::write(return_value, signature_adapter::<F>{call_param_names_raw});
+        std::ptr::write(return_value, signature_adapter::<F>{call_param_names_raw});
         return_value
       }}
     }}
@@ -1613,7 +1613,6 @@ fn boilerplate() -> &'static str {
 
 use std::ffi::c_void;
 use std::os::raw::c_int;
-use std::ptr;
 
 use crate::scope::CallbackScope;
 use crate::support::Opaque;
