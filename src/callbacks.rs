@@ -104,19 +104,6 @@ fn get_flat_name_for_callback_type(e: Entity) -> String {
     .replace("CallbackInfoCallback", "Callback")
 }
 
-fn format_comment(comment: String) -> String {
-  let delims: &[_] = &['/', '*', ' ', '\n'];
-  comment
-    .trim_start_matches(delims)
-    .trim_end_matches(delims)
-    .replacen("", "/// ", 1)
-    .replace("\n * ", "\n/// ")
-    .replace("\n *\n", "\n///\n")
-    .replace("\\code", "```ignore")
-    .replace("\\endcode", "```")
-    .replace(".  ", ". ")
-}
-
 fn to_snake_case(s: impl AsRef<str>) -> String {
   let mut words = vec![];
   for part in s.as_ref().split('_') {
@@ -299,15 +286,14 @@ enum SigType<'tu> {
   IntPtrSize {
     signed: bool,
   },
+  Double,
   Isolate {
     disposition: Disposition,
   },
   CallbackScope {
     param: String,
   },
-  StartupData {
-    disposition: Disposition,
-  },
+  StartupData,
   Local {
     inner_ty: Type<'tu>,
     inner_ty_name: String,
@@ -316,6 +302,9 @@ enum SigType<'tu> {
     inner_ty_name: String,
   },
   PromiseRejectMessage,
+  PropertyDescriptor {
+    disposition: Disposition,
+  },
   CallbackInfo {
     ty_name: String,
     ret_ty_name: Option<String>,
@@ -330,6 +319,9 @@ enum SigType<'tu> {
     info_ty_name: String,
     info_var_name: String,
   },
+  Enum {
+    ty_name: String,
+  },
   Unknown(Type<'tu>),
 }
 
@@ -342,8 +334,8 @@ impl<'tu> Display for SigType<'tu> {
       } => write!(f, "()"),
       Self::Void { disposition } => write!(f, "{:#}c_void", disposition),
       Self::Bool => write!(f, "bool"),
-      Self::Int { signed: true } if raw => write!(f, "int"),
-      Self::Int { signed: false } if raw => write!(f, "unsigned int"),
+      Self::Int { signed: true } if raw => write!(f, "c_int"),
+      Self::Int { signed: false } if raw => write!(f, "c_uint"),
       Self::Int { signed } => Self::IntFixedSize {
         bits: 32,
         signed: *signed,
@@ -356,11 +348,13 @@ impl<'tu> Display for SigType<'tu> {
       } => write!(f, "u{}", bits),
       Self::IntPtrSize { signed: true } => write!(f, "isize"),
       Self::IntPtrSize { signed: false } => write!(f, "usize"),
+      Self::Double if raw => write!(f, "c_double"),
+      Self::Double => write!(f, "f64"),
       Self::Isolate { disposition } => {
         disposition.fmt(f)?;
         write!(f, "Isolate")
       }
-      Self::CallbackScope { .. } => write!(f, "&mut CallbackScope<'s>"),
+      Self::CallbackScope { .. } => write!(f, "&mut HandleScope<'s>"),
       Self::Local { inner_ty_name, .. } => {
         write!(f, "Local<'s, {}>", inner_ty_name)
       }
@@ -368,10 +362,11 @@ impl<'tu> Display for SigType<'tu> {
         write!(f, "Option<Local<'s, {}>>", inner_ty_name)
       }
       Self::PromiseRejectMessage => write!(f, "PromiseRejectMessage<'s>"),
-      Self::StartupData { disposition } => {
+      Self::PropertyDescriptor { disposition } => {
         disposition.fmt(f)?;
-        write!(f, "StartupData")
+        write!(f, "PropertyDescriptor")
       }
+      Self::StartupData => write!(f, "StartupData"),
       Self::CallbackInfo { ty_name, .. } => {
         write!(f, "{:#}{}", Disposition::Const, ty_name)
       }
@@ -379,6 +374,7 @@ impl<'tu> Display for SigType<'tu> {
       Self::CallbackReturnValue { ret_ty_name, .. } => {
         write!(f, "ReturnValue<'s, {}>", ret_ty_name)
       }
+      Self::Enum { ty_name } => write!(f, "{}", ty_name),
       Self::Unknown(mut uty) => {
         eprint!("XX ?? {:?}", uty);
         while let Some(pty) = uty.get_pointee_type() {
@@ -418,6 +414,7 @@ impl<'tu> Sig<'tu> {
     mut rest: impl Iterator<Item = Sig<'tu>>,
     lifetimes: &mut LinkedHashMap<String, LinkedHashSet<String>>,
     raw: bool,
+    for_macro: bool,
   ) {
     match self.ty {
       SigType::CallbackScope { .. }
@@ -426,14 +423,15 @@ impl<'tu> Sig<'tu> {
       | SigType::PromiseRejectMessage
       | SigType::CallbackArguments { .. }
       | SigType::CallbackReturnValue { .. } => {
-        if !lifetimes.contains_key("'s") {
-          lifetimes.insert("'s".to_owned(), Default::default());
+        let lifetime = if for_macro { "'__s" } else { "'s" };
+        if !lifetimes.contains_key(lifetime) {
+          lifetimes.insert(lifetime.to_owned(), Default::default());
         }
       }
       _ => {}
     }
     if let Some(next) = rest.next() {
-      next.gather_lifetimes(rest, lifetimes, raw);
+      next.gather_lifetimes(rest, lifetimes, raw, for_macro);
     }
   }
 
@@ -496,11 +494,13 @@ impl<'tu> Sig<'tu> {
     };
     let fmt_separator = || if with_names && with_types { ": " } else { "" };
     let fmt_name_prefix = |v| {
-      used_inputs
-        .as_ref()
-        .filter(|u| !u.contains(v))
-        .map(|_| "_")
-        .unwrap_or("")
+      if used_inputs.map(|ui| !ui.contains(v)).unwrap_or_default() {
+        "_"
+      } else if v == "type" {
+        "r#"
+      } else {
+        ""
+      }
     };
     let fmt_name = |v| {
       if with_names {
@@ -553,16 +553,16 @@ impl<'tu> Sig<'tu> {
         )
       }
       Sig { id: I::Return, ty } if ty.is_void() => {
-        format!("(\n{})\n", gen_rest(rest))
+        format!("(\n{})", gen_rest(rest))
       }
       Sig { id: I::Return, ty } => {
-        format!("(\n{}) -> {}\n", gen_rest(rest), fmt_type(ty))
+        format!("(\n{}    ) -> {}\n", gen_rest(rest), fmt_type(ty))
       }
       Sig {
         id: I::Param(Some(name)),
         ty,
       } => format!(
-        "  {}{}{},\n{}",
+        "      {}{}{},\n{}",
         fmt_name(name),
         fmt_separator(),
         fmt_type(ty),
@@ -623,6 +623,10 @@ impl<'tu> Sig<'tu> {
       Sig {
         id: SigIdent::Param(Some(name)),
         ty: SigType::Isolate { disposition },
+      }
+      | Sig {
+        id: SigIdent::Param(Some(name)),
+        ty: SigType::PropertyDescriptor { disposition },
       } => {
         assert_ne!(disposition, &Disposition::Owned);
         format!(
@@ -734,6 +738,8 @@ impl<'tu> From<Type<'tu>> for SigType<'tu> {
       M::IntPtrSize { signed: true }
     } else if is_std_type(ty, "size_t") || is_std_type(ty, "uintptr_t") {
       M::IntPtrSize { signed: false }
+    } else if ty.get_kind() == K::Double {
+      M::Double
     } else if let Some(TypeParams::One(inner_ty)) =
       is_v8_type(ty, "Local").and_then(get_type_params)
     {
@@ -767,11 +773,17 @@ impl<'tu> From<Type<'tu>> for SigType<'tu> {
         ret_ty_name,
       }
     } else if let Some(_ty) = is_v8_type(ty, "StartupData") {
-      M::StartupData {
-        disposition: Disposition::Owned,
-      }
+      M::StartupData
     } else if let Some(_ty) = is_v8_type(ty, "PromiseRejectMessage") {
       M::PromiseRejectMessage
+    } else if let Some(pty) = is_v8_type_pointee(ty, "PropertyDescriptor") {
+      M::PropertyDescriptor {
+        disposition: Disposition::new_ptr(pty),
+      }
+    } else if ty.get_kind() == TypeKind::Enum && ty.get_sizeof().unwrap() == 4 {
+      M::Enum {
+        ty_name: get_type_name(ty).unwrap(),
+      }
     } else {
       M::Unknown(ty)
     }
@@ -850,12 +862,13 @@ fn generate_angle_bracket_params<'tu>(
   with_type_params: bool,
   include_unconstrained: bool,
   include_constraints: bool,
+  for_macro: bool,
   wrap_fn: impl Fn(String) -> String,
 ) -> String {
   let mut map = LinkedHashMap::<String, LinkedHashSet<String>>::new();
   if with_lifetimes {
     gather_recursively_with(sigs.to_owned(), |first, rest| {
-      first.gather_lifetimes(rest, &mut map, raw)
+      first.gather_lifetimes(rest, &mut map, raw, for_macro)
     });
   }
   if with_type_params {
@@ -898,19 +911,26 @@ fn generate_call_params<'tu>(
   with_types: bool,
   with_names: bool,
   closure_style: bool,
+  for_macro: bool,
   used_inputs: Option<&HashSet<String>>,
 ) -> String {
-  gather_recursively_with(sigs.to_owned(), |first, rest| {
-    first.generate_call_signature(
-      rest,
-      raw,
-      win64_stack_return_fix,
-      with_types,
-      with_names,
-      closure_style,
-      used_inputs,
-    )
-  })
+  let mut call_params =
+    gather_recursively_with(sigs.to_owned(), |first, rest| {
+      first.generate_call_signature(
+        rest,
+        raw,
+        win64_stack_return_fix,
+        with_types,
+        with_names,
+        closure_style,
+        used_inputs,
+      )
+    });
+  // BLERGH! ugly hack!
+  if for_macro {
+    call_params = call_params.replace("'", "'__");
+  }
+  call_params
 }
 
 fn contains_unknown_cxx_types<'tu>(sigs: &[Sig<'tu>]) -> bool {
@@ -1085,8 +1105,24 @@ fn return_value_requires_win64_stack_return_fix<'tu>(
     .is_some()
 }
 
+fn format_comment(comment: &str) -> String {
+  let delims: &[_] = &['/', '*', ' ', '\n'];
+  comment
+    .trim_start_matches(delims)
+    .trim_end_matches(delims)
+    .replacen("", "/// ", 1)
+    .replace("\n  ", "\n")
+    .replace("\n  ", "\n") // Yes, two times in a row.
+    .replace("\n * ", "\n/// ")
+    .replace("\n *\n", "\n///\n")
+    .replace("\\code", "```ignore")
+    .replace("\\endcode", "```")
+    .replace(".  ", ". ")
+}
+
 fn render_callback_definition<'tu>(
   cb_name: &str,
+  cb_comment: Option<&str>,
   sigs_native: &[Sig<'tu>],
   sigs_raw: &[Sig<'tu>],
   used_inputs: HashSet<String>,
@@ -1094,6 +1130,9 @@ fn render_callback_definition<'tu>(
 ) -> String {
   let cb_name_uc = cb_name;
   let cb_name_lc = to_snake_case(&cb_name);
+  let cb_comment = cb_comment
+    .map(format_comment)
+    .unwrap_or_else(|| format!("// === {} ===\n", &cb_name_uc));
   let for_lifetimes_native = generate_angle_bracket_params(
     sigs_native,
     false,
@@ -1101,6 +1140,17 @@ fn render_callback_definition<'tu>(
     false,
     true,
     false,
+    false,
+    |s| format!("for<{}> ", s),
+  );
+  let for_lifetimes_native_for_macro = generate_angle_bracket_params(
+    sigs_native,
+    false,
+    true,
+    false,
+    true,
+    false,
+    true,
     |s| format!("for<{}> ", s),
   );
   let lifetimes_native = generate_angle_bracket_params(
@@ -1109,6 +1159,7 @@ fn render_callback_definition<'tu>(
     true,
     false,
     true,
+    false,
     false,
     |s| s,
   );
@@ -1119,6 +1170,7 @@ fn render_callback_definition<'tu>(
     false,
     true,
     false,
+    false,
     |s| format!("for<{}> ", s),
   );
   let lifetimes_raw_comma = generate_angle_bracket_params(
@@ -1128,16 +1180,44 @@ fn render_callback_definition<'tu>(
     false,
     true,
     false,
+    false,
     |s| format!("{}, ", s),
   );
-  let call_param_types_native =
-    generate_call_params(sigs_native, false, false, true, false, false, None);
-  let call_param_types_raw =
-    generate_call_params(sigs_raw, true, false, true, false, false, None);
+  let call_param_types_native = generate_call_params(
+    sigs_native,
+    false,
+    false,
+    true,
+    false,
+    false,
+    false,
+    None,
+  );
+  let call_param_types_native_for_macro = generate_call_params(
+    sigs_native,
+    false,
+    false,
+    true,
+    false,
+    false,
+    true,
+    None,
+  );
+  let call_param_types_raw = generate_call_params(
+    sigs_raw, true, false, true, false, false, false, None,
+  );
   let call_param_types_raw_win64fix =
-    generate_call_params(sigs_raw, true, true, true, false, false, None);
-  let call_param_names_native =
-    generate_call_params(sigs_native, false, false, false, true, false, None);
+    generate_call_params(sigs_raw, true, true, true, false, false, false, None);
+  let call_param_names_native = generate_call_params(
+    sigs_native,
+    false,
+    false,
+    false,
+    true,
+    false,
+    false,
+    None,
+  );
   let call_param_names_native_closure_notused = generate_call_params(
     sigs_native,
     false,
@@ -1145,6 +1225,7 @@ fn render_callback_definition<'tu>(
     false,
     true,
     true,
+    false,
     Some(&Default::default()),
   );
   let call_param_names_raw = generate_call_params(
@@ -1153,6 +1234,7 @@ fn render_callback_definition<'tu>(
     false,
     false,
     true,
+    false,
     false,
     Some(&used_inputs),
   );
@@ -1163,6 +1245,7 @@ fn render_callback_definition<'tu>(
     true,
     true,
     false,
+    false,
     Some(&Default::default()),
   );
   let call_params_full_raw = generate_call_params(
@@ -1171,6 +1254,7 @@ fn render_callback_definition<'tu>(
     false,
     true,
     true,
+    false,
     false,
     Some(&used_inputs),
   );
@@ -1181,109 +1265,73 @@ fn render_callback_definition<'tu>(
     true,
     true,
     false,
+    false,
     Some(&used_inputs),
   );
   let raw_to_native_conversions = gather_raw_to_native_conversions(sigs_native);
 
   let common_code = format!(
     r#"
-// *** {cb_name_uc} ***
+{cb_comment}
+#[derive(Copy, Clone)]
+#[repr(transparent)]
+pub struct {cb_name_uc}(Raw{cb_name_uc});
 
-pub trait {cb_name_uc}:
+pub trait Into{cb_name_uc}:
   UnitType
-  + {for_lifetimes_native}Fn{call_param_types_native}
-{{
-}}
+  + Into<{cb_name_uc}>
+  + {for_lifetimes_native}FnOnce{call_param_types_native}
+{{ }}
 
-impl<F> {cb_name_uc} for F where
+impl<F> Into{cb_name_uc} for F where
   F: UnitType
-    + {for_lifetimes_native}Fn{call_param_types_native}
-{{
-}}
+    + Into<{cb_name_uc}>
+    + {for_lifetimes_native}FnOnce{call_param_types_native}
+{{ }}
 
 #[macro_export]
-macro_rules! impl_{cb_name_lc} {{
+macro_rules! impl_into_{cb_name_lc} {{
   () => {{
-impl {cb_name_uc}
-  + {for_lifetimes_native}Fn{call_param_types_native}
-  }};
+    impl $crate::support::UnitType
+    + Into<{cb_name_uc}>
+    + {for_lifetimes_native_for_macro}FnOnce{call_param_types_native_for_macro}  }};
 }}
-
-struct {cb_name_uc}Tag;
 "#,
     cb_name_uc = cb_name_uc,
     cb_name_lc = cb_name_lc,
+    cb_comment = cb_comment,
     for_lifetimes_native = for_lifetimes_native,
+    for_lifetimes_native_for_macro = for_lifetimes_native_for_macro,
     call_param_types_native = call_param_types_native,
-  );
-
-  let test_code = format!(
-    r#"
-#[cfg(test)]
-fn {cb_name_lc}_mock<{lifetimes_native}>{call_params_full_native_notused} {{
-  unimplemented!()
-}}
-
-#[test]
-fn {cb_name_lc}_as_type_param() {{
-  fn pass_as_type_param<F>(_: F) -> F::CxxFn
-  where F: {cb_name_uc} + CxxCallback<{cb_name_uc}Tag, CxxFn = Cxx{cb_name_uc}> {{
-    F::cxx_fn()
-  }} 
-  let _ = pass_as_type_param({cb_name_lc}_mock);
-  let _ = pass_as_type_param(&{cb_name_lc}_mock);
-}}
-
-#[test]
-fn {cb_name_lc}_as_impl_trait() {{
-  fn pass_as_impl_trait(f: impl {cb_name_uc} + CxxCallback<{cb_name_uc}Tag, CxxFn = Cxx{cb_name_uc}>) -> Cxx{cb_name_uc} {{
-    f.cxx_fn_from_val()
-  }}
-  let _ = pass_as_impl_trait({cb_name_lc}_mock);
-  let _ = pass_as_impl_trait(&{cb_name_lc}_mock);
-}}
-
-/*
-#[test]
-fn {cb_name_lc}_as_impl_with_macro() {{
-  fn pass_as_impl_with_macro(f: impl_{cb_name_lc}!()) -> Cxx{cb_name_uc} {{
-    f.cxx_fn_from_val()
-  }}
-  let _ = pass_as_impl_with_macro({cb_name_lc}_mock);
-  let _ = pass_as_impl_with_macro({call_param_names_native_closure_notused} unimplemented!());
-}}
-*/
-"#,
-    cb_name_uc = cb_name_uc,
-    cb_name_lc = cb_name_lc,
-    lifetimes_native = lifetimes_native,
-    call_param_names_native_closure_notused =
-      call_param_names_native_closure_notused,
-    call_params_full_native_notused = call_params_full_native_notused
+    call_param_types_native_for_macro = call_param_types_native_for_macro,
   );
 
   let abi_specific_code = if !use_win64fix {
     format!(
       r#"
-type Cxx{cb_name_uc} = {for_lifetimes_raw}extern "C" fn{call_param_types_raw};
+type Raw{cb_name_uc} = {for_lifetimes_raw}extern "C" fn{call_param_types_raw};
 
-impl<F: {cb_name_uc}> CxxCallback<{cb_name_uc}Tag> for F {{
-  type CxxFn = Cxx{cb_name_uc};
-
-  fn cxx_fn() -> Self::CxxFn {{
+impl<F> From<F> for {cb_name_uc}
+where 
+  F: UnitType
+    + {for_lifetimes_native}FnOnce{call_param_types_native}
+{{
+  fn from(_: F) -> Self {{
     #[inline(always)]
-    extern "C" fn adapter<{lifetimes_raw_comma}F: {cb_name_uc}>{call_params_full_raw} {{
+    extern "C" fn adapter<{lifetimes_raw_comma}F: Into{cb_name_uc}>{call_params_full_raw} {{
       {raw_to_native_conversions}
       (F::get()){call_param_names_native}
     }}
 
-    adapter::<F>
+    Self(adapter::<F>)
   }}
 }}
 "#,
       cb_name_uc = cb_name_uc,
+      for_lifetimes_native = for_lifetimes_native,
       for_lifetimes_raw = for_lifetimes_raw,
       lifetimes_raw_comma = lifetimes_raw_comma,
+      call_param_types_native = call_param_types_native,
       call_param_types_raw = call_param_types_raw,
       call_param_names_native = call_param_names_native,
       call_params_full_raw = call_params_full_raw,
@@ -1293,43 +1341,47 @@ impl<F: {cb_name_uc}> CxxCallback<{cb_name_uc}Tag> for F {{
     format!(
       r#"
 #[cfg(target_family = "unix")]
-type Cxx{cb_name_uc} = {for_lifetimes_raw}extern "C" fn{call_param_types_raw};
+type Raw{cb_name_uc} = {for_lifetimes_raw}extern "C" fn{call_param_types_raw};
 
 #[cfg(all(target_family = "windows", target_arch = "x86_64"))]
-type Cxx{cb_name_uc} = {for_lifetimes_raw}extern "C" fn{call_param_types_raw_win64fix};
+type Raw{cb_name_uc} = {for_lifetimes_raw}extern "C" fn{call_param_types_raw_win64fix};
 
-impl<F: {cb_name_uc}> CxxCallback<{cb_name_uc}Tag> for F {{
-  type CxxFn = Cxx{cb_name_uc};
-
-  fn cxx_fn() -> Self::CxxFn {{
+impl<F> From<F> for {cb_name_uc}
+  where 
+    F: UnitType
+      + {for_lifetimes_native}FnOnce{call_param_types_native}
+{{
+  fn from(_: F) -> Self {{
     #[inline(always)]
-    fn signature_adapter<{lifetimes_raw_comma}F: {cb_name_uc}>{call_params_full_raw} {{
+    fn signature_adapter<{lifetimes_raw_comma}F: Into{cb_name_uc}>{call_params_full_raw} {{
       {raw_to_native_conversions}
       (F::get()){call_param_names_native}
     }}
 
     #[cfg(target_family = "unix")]
     #[inline(always)]
-    extern "C" fn abi_adapter<'a, F: {cb_name_uc}>{call_params_full_raw} {{
+    extern "C" fn abi_adapter<'a, F: Into{cb_name_uc}>{call_params_full_raw} {{
       signature_adapter::<F>{call_param_names_raw}
     }}
 
     #[cfg(all(target_family = "windows", target_arch = "x86_64"))]
     #[inline(always)]
-    extern "C" fn abi_adapter<{lifetimes_raw_comma}F: {cb_name_uc}>{call_params_full_raw_win64fix} {{
+    extern "C" fn abi_adapter<{lifetimes_raw_comma}F: Into{cb_name_uc}>{call_params_full_raw_win64fix} {{
       unsafe {{
         ptr::write(return_value, signature_adapter::<F>{call_param_names_raw});
         return_value
       }}
     }}
 
-    abi_adapter::<F>
+    Self(abi_adapter::<F>)
   }}
 }}
 "#,
       cb_name_uc = cb_name_uc,
+      for_lifetimes_native = for_lifetimes_native,
       for_lifetimes_raw = for_lifetimes_raw,
       lifetimes_raw_comma = lifetimes_raw_comma,
+      call_param_types_native = call_param_types_native,
       call_param_types_raw = call_param_types_raw,
       call_param_types_raw_win64fix = call_param_types_raw_win64fix,
       call_param_names_native = call_param_names_native,
@@ -1339,6 +1391,46 @@ impl<F: {cb_name_uc}> CxxCallback<{cb_name_uc}Tag> for F {{
       raw_to_native_conversions = raw_to_native_conversions,
     )
   };
+
+  let test_code = format!(
+    r#"
+#[cfg(test)]
+fn mock_{cb_name_lc}<{lifetimes_native}>{call_params_full_native_notused} {{
+  unimplemented!()
+}}
+
+#[test]
+fn {cb_name_lc}_type_param() {{
+  fn pass_by_type_param<F: Into{cb_name_uc}>(_: F) -> {cb_name_uc} {{
+    F::get().into()
+  }} 
+  let _ = pass_by_type_param(mock_{cb_name_lc});
+}}
+
+#[test]
+fn {cb_name_lc}_impl_into_trait() {{
+  fn pass_by_impl_into_trait(f: impl Into<{cb_name_uc}>) -> {cb_name_uc} {{
+    f.into()
+  }}
+  let _ = pass_by_impl_into_trait(mock_{cb_name_lc});
+}}
+
+#[test]
+fn {cb_name_lc}_impl_into_macro() {{
+  fn pass_by_impl_into_macro(f: impl_into_{cb_name_lc}!()) -> {cb_name_uc} {{
+    f.into()
+  }}
+  let _ = pass_by_impl_into_macro(mock_{cb_name_lc});
+  let _ = pass_by_impl_into_macro({call_param_names_native_closure_notused} unimplemented!());
+}}
+"#,
+    cb_name_uc = cb_name_uc,
+    cb_name_lc = cb_name_lc,
+    lifetimes_native = lifetimes_native,
+    call_param_names_native_closure_notused =
+      call_param_names_native_closure_notused,
+    call_params_full_native_notused = call_params_full_native_notused
+  );
 
   let code = format!(
     "{common_code}\n{abi_specific_code}\n{test_code}",
@@ -1350,6 +1442,7 @@ impl<F: {cb_name_uc}> CxxCallback<{cb_name_uc}Tag> for F {{
   code
 }
 
+#[allow(dead_code)]
 fn comment_out(code: String) -> String {
   code
     .lines()
@@ -1362,6 +1455,7 @@ fn visit_callback_definition<'tu>(
   fn_ty: Type<'tu>, // The callback function prototype.
 ) -> Option<()> {
   let cb_name = get_flat_name_for_callback_type(e);
+  let cb_comment = e.get_comment();
   let ret_ty = fn_ty.get_result_type()?;
   let arg_names = e
     .get_children()
@@ -1376,17 +1470,19 @@ fn visit_callback_definition<'tu>(
   let sigs_native = convert_raw_signature_to_native(&sigs_raw);
   let used_inputs = gather_used_inputs(&sigs_native);
   let use_win64fix = return_value_requires_win64_stack_return_fix(&sigs_raw);
-  let mut code = render_callback_definition(
+  let code = render_callback_definition(
     &cb_name,
+    cb_comment.as_deref(),
     &sigs_native,
     &sigs_raw,
     used_inputs,
     use_win64fix,
   );
   if contains_unknown_cxx_types(&sigs_raw) {
-    code = comment_out(code);
+    // println!("{}", comment_out(code));
+  } else {
+    println!("{}", code);
   }
-  println!("{}", code);
   Some(())
 }
 
@@ -1445,7 +1541,7 @@ fn boilerplate() -> &'static str {
   r#"
 // Copyright 2019-2020 the Deno authors. All rights reserved. MIT license.
 
-//! # Why these `impl_some_callback!()` macros?
+//! # Why these `impl_into_some_callback!()` macros?
 //!
 //! It appears that Rust is unable to use information that is available from
 //! super traits for type and/or lifetime inference purposes. This causes it to
@@ -1516,16 +1612,18 @@ fn boilerplate() -> &'static str {
 #![allow(clippy::needless_lifetimes)]
 
 use std::ffi::c_void;
+use std::os::raw::c_int;
 use std::ptr;
 
 use crate::scope::CallbackScope;
-use crate::support::int;
+use crate::support::Opaque;
 use crate::support::UnitType;
 use crate::Array;
 use crate::Boolean;
 use crate::Context;
 use crate::FunctionCallbackArguments;
 use crate::FunctionCallbackInfo;
+use crate::HandleScope;
 use crate::Integer;
 use crate::Isolate;
 use crate::Local;
@@ -1540,15 +1638,18 @@ use crate::PropertyCallbackInfo;
 use crate::ReturnValue;
 use crate::ScriptOrModule;
 use crate::StartupData;
+use crate::String;
 use crate::Value;
 
-trait CxxCallback<Tag = ()>: UnitType {
-  type CxxFn;
-  fn cxx_fn() -> Self::CxxFn;
-  fn cxx_fn_from_val(&'_ self) -> Self::CxxFn {
-    Self::cxx_fn()
-  }
-}
+// Placeholder types that don't have Rust bindings yet.
+#[repr(C)] pub struct PropertyDescriptor(Opaque);
+#[repr(C)] pub enum  AccessType { _TODO }
+#[repr(C)] pub enum  AtomicsWaitEvent { _TODO }
+#[repr(C)] pub enum  CrashKeyId { _TODO }
+#[repr(C)] pub enum  GCCallbackFlags { _TODO }
+#[repr(C)] pub enum  GCType { _TODO }
+#[repr(C)] pub enum  PromiseHookType { _TODO }
+#[repr(C)] pub enum  UseCounterFeature { _TODO }
 "#
   .trim()
 }
