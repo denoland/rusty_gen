@@ -3,15 +3,19 @@
 use clang::*;
 use linked_hash_map::LinkedHashMap;
 use linked_hash_set::LinkedHashSet;
-use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::{self, Display, Formatter};
 use std::hash::Hash;
+use std::io;
+use std::io::Write;
 use std::iter::once;
 use std::iter::IntoIterator;
+use std::process::Command;
+use std::process::Output;
+use std::process::Stdio;
 use std::vec;
 
-type CallbackIndex<'tu> = HashMap<Entity<'tu>, String>;
+type CallbackIndex<'tu> = Vec<String>;
 
 fn get_single_base_class(e: Entity) -> Option<Entity> {
   let mut it = e
@@ -180,12 +184,20 @@ fn is_v8_isolate_type<'tu>(ty: Type<'tu>, name: &str) -> Option<Type<'tu>> {
   let _def = ty
     .get_declaration()
     .filter(|d| d.get_name().map(|n| n == name).unwrap_or(false))
-    .filter(|d| d.get_semantic_parent().map(|e| is_v8_top_level_class(e, "Isolate")).unwrap_or(false))?;
+    .filter(|d| {
+      d.get_semantic_parent()
+        .map(|e| is_v8_top_level_class(e, "Isolate"))
+        .unwrap_or(false)
+    })?;
   Some(ty)
 }
 
-fn is_v8_isolate_type_pointee<'tu>(ty: Type<'tu>, name: &str) -> Option<Type<'tu>> {
-  ty.get_pointee_type().and_then(|ty| is_v8_isolate_type(ty, name))
+fn is_v8_isolate_type_pointee<'tu>(
+  ty: Type<'tu>,
+  name: &str,
+) -> Option<Type<'tu>> {
+  ty.get_pointee_type()
+    .and_then(|ty| is_v8_isolate_type(ty, name))
 }
 
 fn is_void_type<'tu>(ty: Type<'tu>) -> bool {
@@ -317,6 +329,7 @@ enum SigType<'tu> {
   MaybeLocal {
     inner_ty_name: String,
   },
+  ModifyCodeGenerationFromStringsResult,
   PromiseRejectMessage,
   CallbackInfo {
     ty_name: String,
@@ -343,7 +356,7 @@ enum SigType<'tu> {
     disposition: Disposition,
     ptr_name: String,
     len_name: String,
-    needs_cast: bool
+    needs_cast: bool,
   },
   Unknown(Type<'tu>),
 }
@@ -358,14 +371,34 @@ impl<'tu> Display for SigType<'tu> {
       Self::Void { disposition } => write!(f, "{:#}c_void", disposition),
       Self::Bool => write!(f, "bool"),
       Self::Char {
+        signed: None,
+        disposition: Disposition::Const,
+      } if raw => write!(f, "{:#}c_char", Disposition::Const),
+      Self::Char {
+        signed: None,
+        disposition: Disposition::Const,
+      } => write!(f, "{}str", Disposition::Const),
+      Self::Char {
         signed: Some(false),
         disposition,
       } if raw => write!(f, "{:#}c_uchar", disposition),
       Self::Char { .. } => unreachable!(),
-      Self::Int { disposition, signed: false } if raw => write!(f, "{:#}c_uint", disposition),
-      Self::Int { disposition, signed: true } if raw => write!(f, "{:#}c_int", disposition),
-      Self::Int { disposition, signed: false } => write!(f, "{}u32", disposition),
-      Self::Int { disposition, signed: true } => write!(f, "{}i32", disposition),
+      Self::Int {
+        disposition,
+        signed: false,
+      } if raw => write!(f, "{:#}c_uint", disposition),
+      Self::Int {
+        disposition,
+        signed: true,
+      } if raw => write!(f, "{:#}c_int", disposition),
+      Self::Int {
+        disposition,
+        signed: false,
+      } => write!(f, "{}u32", disposition),
+      Self::Int {
+        disposition,
+        signed: true,
+      } => write!(f, "{}i32", disposition),
       Self::IntFixedSize { bits, signed: true } => write!(f, "i{}", bits),
       Self::IntFixedSize {
         bits,
@@ -386,6 +419,9 @@ impl<'tu> Display for SigType<'tu> {
       Self::MaybeLocal { inner_ty_name } => {
         write!(f, "Option<Local<'s, {}>>", inner_ty_name)
       }
+      Self::ModifyCodeGenerationFromStringsResult => {
+        write!(f, "ModifyCodeGenerationFromStringsResult<'s>")
+      }
       Self::PromiseRejectMessage => write!(f, "PromiseRejectMessage<'s>"),
       Self::CallbackInfo { ty_name, .. } => {
         write!(f, "{:#}{}", Disposition::Const, ty_name)
@@ -394,7 +430,10 @@ impl<'tu> Display for SigType<'tu> {
       Self::CallbackReturnValue { ret_ty_name, .. } => {
         write!(f, "ReturnValue<'s, {}>", ret_ty_name)
       }
-      Self::Struct { disposition, ty_name } => {
+      Self::Struct {
+        disposition,
+        ty_name,
+      } => {
         disposition.fmt(f)?;
         ty_name.fmt(f)
       }
@@ -405,12 +444,21 @@ impl<'tu> Display for SigType<'tu> {
       }
       Self::Unknown(mut uty) => {
         eprint!("XX ?? {:?}", uty);
-        while let Some(pty) = uty.get_pointee_type() {
+        while let Some(pty) = uty.get_pointee_type().or_else(|| {
+          Some(uty)
+            .map(|uty| uty.get_canonical_type())
+            .filter(|&cty| cty != uty)
+        }) {
           eprint!(" ~> {:?}", pty);
           Disposition::new_ptr(pty).fmt(f)?;
           uty = pty;
         }
-        eprintln!("  sizeof={:?}  sz[]={:?}", uty.get_sizeof(), uty.get_size());
+        eprintln!(
+          "  sizeof={:?}  sz[]={:?}  fields={:?}",
+          uty.get_sizeof(),
+          uty.get_size(),
+          uty.get_fields()
+        );
         write!(
           f,
           "{}??",
@@ -449,6 +497,7 @@ impl<'tu> Sig<'tu> {
       SigType::CallbackScope { .. }
       | SigType::Local { .. }
       | SigType::MaybeLocal { .. }
+      | SigType::ModifyCodeGenerationFromStringsResult { .. }
       | SigType::PromiseRejectMessage
       | SigType::CallbackArguments { .. }
       | SigType::CallbackReturnValue { .. } => {
@@ -487,6 +536,10 @@ impl<'tu> Sig<'tu> {
       | Sig {
         id: SigIdent::Return,
         ty: SigType::MaybeLocal { .. },
+      }
+      | Sig {
+        id: SigIdent::Return,
+        ty: SigType::ModifyCodeGenerationFromStringsResult,
       } => true,
       _ => false,
     }
@@ -661,24 +714,34 @@ impl<'tu> Sig<'tu> {
       Sig {
         id: SigIdent::Param(Some(name)),
         ty: SigType::Int { disposition, .. },
-      } | 
-      Sig {
+      }
+      | Sig {
         id: SigIdent::Param(Some(name)),
         ty: SigType::Isolate { disposition },
       }
       | Sig {
         id: SigIdent::Param(Some(name)),
         ty: SigType::Struct { disposition, .. },
-      }
-        if disposition.is_ptr() => {
-        format!(
-          "  let {} = unsafe {{ {}*{} }};\n{}",
-          name,
-          disposition,
-          name,
-          gen_rest(rest)
-        )
-      }
+      } if disposition.is_ptr() => format!(
+        "  let {} = unsafe {{ {}*{} }};\n{}",
+        name,
+        disposition,
+        name,
+        gen_rest(rest)
+      ),
+      Sig {
+        id: SigIdent::Param(Some(name)),
+        ty:
+          SigType::Char {
+            disposition: Disposition::Const,
+            signed: None,
+          },
+      } => format!(
+        "  let {} = unsafe {{ CStr::from_ptr({}) }}.to_str().unwrap();\n{}",
+        name,
+        name,
+        gen_rest(rest)
+      ),
       Sig {
         id: SigIdent::Param(Some(name)),
         ty: SigType::CallbackScope { param },
@@ -727,7 +790,7 @@ impl<'tu> Sig<'tu> {
             disposition,
             ptr_name,
             len_name,
-            needs_cast
+            needs_cast,
           },
       } => {
         let method = match disposition {
@@ -737,7 +800,7 @@ impl<'tu> Sig<'tu> {
         };
         let cast = match needs_cast {
           true => format!(" as {:#} u8", disposition),
-          false => "".to_owned()
+          false => "".to_owned(),
         };
         format!(
           "  let {} = unsafe {{ slice::{}({}{}, {}) }};\n{}",
@@ -783,6 +846,16 @@ impl<'tu> From<Type<'tu>> for SigType<'tu> {
       }
     } else if ty.get_kind() == K::Bool {
       M::Bool
+    } else if let Some(pty) =
+      ty.get_pointee_type().filter(|pty| match pty.get_kind() {
+        K::CharS | K::CharU => true,
+        _ => false,
+      })
+    {
+      M::Char {
+        disposition: Disposition::new_ptr(pty),
+        signed: None,
+      }
     } else if let Some(pty) = ty
       .get_pointee_type()
       .filter(|pty| pty.get_kind() == K::UChar)
@@ -792,10 +865,12 @@ impl<'tu> From<Type<'tu>> for SigType<'tu> {
         signed: Some(false),
       }
     } else if ty.get_kind() == K::Int {
-      M::Int { disposition: Disposition::Owned, signed: true }
-    } else if let Some(pty) = ty
-      .get_pointee_type()
-      .filter(|pty| pty.get_kind() == K::Int)
+      M::Int {
+        disposition: Disposition::Owned,
+        signed: true,
+      }
+    } else if let Some(pty) =
+      ty.get_pointee_type().filter(|pty| pty.get_kind() == K::Int)
     {
       M::Int {
         disposition: Disposition::new_ptr(pty),
@@ -859,21 +934,33 @@ impl<'tu> From<Type<'tu>> for SigType<'tu> {
         ty_name,
         ret_ty_name,
       }
+    } else if let Some(_ty) =
+      is_v8_type(ty, "ModifyCodeGenerationFromStringsResult")
+    {
+      M::ModifyCodeGenerationFromStringsResult
     } else if let Some(_ty) = is_v8_type(ty, "PromiseRejectMessage") {
       M::PromiseRejectMessage
     } else if let Some(_ty) = is_v8_type(ty, "StartupData") {
-      M::Struct { ty_name: "StartupData".to_owned(), disposition: Disposition::Owned }
+      M::Struct {
+        ty_name: "StartupData".to_owned(),
+        disposition: Disposition::Owned,
+      }
     } else if let Some(pty) = is_v8_type_pointee(ty, "JitCodeEvent") {
       M::Struct {
-        ty_name: "JitCodeEvent".to_owned(), disposition: Disposition::new_ptr(pty),
-      }    
+        ty_name: "JitCodeEvent".to_owned(),
+        disposition: Disposition::new_ptr(pty),
+      }
     } else if let Some(pty) = is_v8_type_pointee(ty, "PropertyDescriptor") {
       M::Struct {
-        ty_name: "PropertyDescriptor".to_owned(), disposition: Disposition::new_ptr(pty),
+        ty_name: "PropertyDescriptor".to_owned(),
+        disposition: Disposition::new_ptr(pty),
       }
-    } else if let Some(pty) = is_v8_isolate_type_pointee(ty, "AtomicsWaitWakeHandle") {
+    } else if let Some(pty) =
+      is_v8_isolate_type_pointee(ty, "AtomicsWaitWakeHandle")
+    {
       M::Struct {
-        ty_name: "AtomicsWaitWakeHandle".to_owned(), disposition: Disposition::new_ptr(pty),
+        ty_name: "AtomicsWaitWakeHandle".to_owned(),
+        disposition: Disposition::new_ptr(pty),
       }
     } else if ty.get_kind() == TypeKind::Enum && ty.get_sizeof().unwrap() == 4 {
       M::Enum {
@@ -1573,7 +1660,7 @@ fn comment_out(code: String) -> String {
 fn visit_callback_definition<'tu>(
   e: Entity<'tu>,   // The typedef definition node.
   fn_ty: Type<'tu>, // The callback function prototype.
-) -> Option<()> {
+) -> Option<String> {
   let cb_name = get_flat_name_for_callback_type(e);
   let cb_comment = e.get_comment();
   let ret_ty = fn_ty.get_result_type()?;
@@ -1599,17 +1686,17 @@ fn visit_callback_definition<'tu>(
     use_win64fix,
   );
   if contains_unknown_cxx_types(&sigs_raw) {
-    //println!("{}", comment_out(code));
+    // Some(comment_out(code))
+    None
   } else {
-    println!("{}", code);
+    Some(code)
   }
-  Some(())
 }
 
 fn visit_declaration<'tu>(
-  _index: &mut CallbackIndex<'tu>,
+  index: &mut CallbackIndex<'tu>,
   e: Entity<'tu>,
-) -> Option<()> {
+) -> Option<String> {
   if e.is_definition() {
     if let Some(ty) = e.get_typedef_underlying_type() {
       if ty.get_kind() == TypeKind::Pointer {
@@ -1617,13 +1704,15 @@ fn visit_declaration<'tu>(
           if pointee_ty.get_kind() == TypeKind::FunctionPrototype
             && is_type_used(e.get_translation_unit(), ty)
           {
-            visit_callback_definition(e, pointee_ty);
+            if let Some(code) = visit_callback_definition(e, pointee_ty) {
+              index.push(code);
+            }
           }
         }
       }
     }
   }
-  Some(())
+  None
 }
 
 fn visit_v8_ns<'tu>(index: &mut CallbackIndex<'tu>, ns: Entity<'tu>) {
@@ -1637,7 +1726,9 @@ fn visit_v8_ns<'tu>(index: &mut CallbackIndex<'tu>, ns: Entity<'tu>) {
   });
 }
 
-fn visit_translation_unit<'tu>(translation_unit: &'tu TranslationUnit<'tu>) {
+fn visit_translation_unit<'tu>(
+  translation_unit: &'tu TranslationUnit<'tu>,
+) -> String {
   let root = translation_unit.get_entity();
   let mut index = CallbackIndex::new();
   root.visit_children(|e, _| {
@@ -1650,11 +1741,48 @@ fn visit_translation_unit<'tu>(translation_unit: &'tu TranslationUnit<'tu>) {
       EntityVisitResult::Recurse
     }
   });
+  index.join("\n")
 }
 
 pub fn generate(tu: &TranslationUnit) {
-  println!("{}", boilerplate());
-  visit_translation_unit(tu);
+  let code = format!("{}\n{}", boilerplate(), visit_translation_unit(tu));
+  let code = rustfmt(&code);
+  print!("{}", code);
+}
+
+fn rustfmt(code: &str) -> String {
+  run_rustfmt(code, true)
+    .or_else(|_| run_rustfmt(code, false))
+    .unwrap()
+}
+
+fn run_rustfmt(code: &str, nightly: bool) -> io::Result<String> {
+  let mut c = Command::new("rustfmt");
+  c.stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .arg("--edition=2018")
+    .arg(rustfmt_config("max_width", 80))
+    .arg(rustfmt_config("tab_spaces", 2));
+  if nightly {
+    c.arg("--unstable-features")
+      .arg(rustfmt_config("format_macro_matchers", true))
+      .arg(rustfmt_config("format_macro_bodies", true));
+  }
+  let mut c = c.spawn()?;
+  c.stdin.as_mut().unwrap().write_all(code.as_bytes())?;
+  let stdout = match c.wait_with_output()? {
+    Output { status, stdout, .. } if status.success() => Ok(stdout),
+    Output { status, .. } => Err(io::Error::new(
+      io::ErrorKind::Other,
+      format!("rustfmt exit status: {:?}", status),
+    )),
+  }?;
+  String::from_utf8(stdout)
+    .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+}
+
+fn rustfmt_config<V: Display>(key: &str, value: V) -> String {
+  format!("--config={}={}", key, value)
 }
 
 fn boilerplate() -> &'static str {
@@ -1733,6 +1861,8 @@ fn boilerplate() -> &'static str {
 #![allow(clippy::too_many_arguments)]
 
 use std::ffi::c_void;
+use std::ffi::CStr;
+use std::os::raw::c_char;
 use std::os::raw::c_int;
 use std::os::raw::c_double;
 use std::os::raw::c_uchar;
@@ -1776,6 +1906,21 @@ use crate::Value;
 #[repr(C)] pub enum  GCType { _TODO }
 #[repr(C)] pub enum  PromiseHookType { _TODO }
 #[repr(C)] pub enum  UseCounterFeature { _TODO }
+
+// Notes:
+// * This enum should really be #[repr(bool)] but Rust doesn't support that.
+// * It must have the same layout as the C++ struct. Do not reorder fields!
+#[repr(u8)]
+pub enum ModifyCodeGenerationFromStringsResult<'s> {
+  /// Block the codegen algorithm.
+  Block,
+  /// Proceed with the codegen algorithm. Otherwise, block it.
+  Allow {
+    /// Overwrite the original source with this string, if present.
+    /// Use the original source if empty.
+    modified_source: Option<Local<'s, String>>,
+  },
+}
 "#
   .trim()
 }
