@@ -176,6 +176,18 @@ fn is_v8_type_pointee<'tu>(ty: Type<'tu>, name: &str) -> Option<Type<'tu>> {
   ty.get_pointee_type().and_then(|ty| is_v8_type(ty, name))
 }
 
+fn is_v8_isolate_type<'tu>(ty: Type<'tu>, name: &str) -> Option<Type<'tu>> {
+  let _def = ty
+    .get_declaration()
+    .filter(|d| d.get_name().map(|n| n == name).unwrap_or(false))
+    .filter(|d| d.get_semantic_parent().map(|e| is_v8_top_level_class(e, "Isolate")).unwrap_or(false))?;
+  Some(ty)
+}
+
+fn is_v8_isolate_type_pointee<'tu>(ty: Type<'tu>, name: &str) -> Option<Type<'tu>> {
+  ty.get_pointee_type().and_then(|ty| is_v8_isolate_type(ty, name))
+}
+
 fn is_void_type<'tu>(ty: Type<'tu>) -> bool {
   ty.get_kind() == TypeKind::Void
 }
@@ -276,7 +288,12 @@ enum SigType<'tu> {
     disposition: Disposition,
   },
   Bool,
+  Char {
+    disposition: Disposition,
+    signed: Option<bool>,
+  },
   Int {
+    disposition: Disposition,
     signed: bool,
   },
   IntFixedSize {
@@ -293,7 +310,6 @@ enum SigType<'tu> {
   CallbackScope {
     param: String,
   },
-  StartupData,
   Local {
     inner_ty: Type<'tu>,
     inner_ty_name: String,
@@ -302,9 +318,6 @@ enum SigType<'tu> {
     inner_ty_name: String,
   },
   PromiseRejectMessage,
-  PropertyDescriptor {
-    disposition: Disposition,
-  },
   CallbackInfo {
     ty_name: String,
     ret_ty_name: Option<String>,
@@ -319,8 +332,18 @@ enum SigType<'tu> {
     info_ty_name: String,
     info_var_name: String,
   },
+  Struct {
+    ty_name: String,
+    disposition: Disposition,
+  },
   Enum {
     ty_name: String,
+  },
+  ByteSlice {
+    disposition: Disposition,
+    ptr_name: String,
+    len_name: String,
+    needs_cast: bool
   },
   Unknown(Type<'tu>),
 }
@@ -334,13 +357,15 @@ impl<'tu> Display for SigType<'tu> {
       } => write!(f, "()"),
       Self::Void { disposition } => write!(f, "{:#}c_void", disposition),
       Self::Bool => write!(f, "bool"),
-      Self::Int { signed: true } if raw => write!(f, "c_int"),
-      Self::Int { signed: false } if raw => write!(f, "c_uint"),
-      Self::Int { signed } => Self::IntFixedSize {
-        bits: 32,
-        signed: *signed,
-      }
-      .fmt(f),
+      Self::Char {
+        signed: Some(false),
+        disposition,
+      } if raw => write!(f, "{:#}c_uchar", disposition),
+      Self::Char { .. } => unreachable!(),
+      Self::Int { disposition, signed: false } if raw => write!(f, "{:#}c_uint", disposition),
+      Self::Int { disposition, signed: true } if raw => write!(f, "{:#}c_int", disposition),
+      Self::Int { disposition, signed: false } => write!(f, "{}u32", disposition),
+      Self::Int { disposition, signed: true } => write!(f, "{}i32", disposition),
       Self::IntFixedSize { bits, signed: true } => write!(f, "i{}", bits),
       Self::IntFixedSize {
         bits,
@@ -362,11 +387,6 @@ impl<'tu> Display for SigType<'tu> {
         write!(f, "Option<Local<'s, {}>>", inner_ty_name)
       }
       Self::PromiseRejectMessage => write!(f, "PromiseRejectMessage<'s>"),
-      Self::PropertyDescriptor { disposition } => {
-        disposition.fmt(f)?;
-        write!(f, "PropertyDescriptor")
-      }
-      Self::StartupData => write!(f, "StartupData"),
       Self::CallbackInfo { ty_name, .. } => {
         write!(f, "{:#}{}", Disposition::Const, ty_name)
       }
@@ -374,10 +394,19 @@ impl<'tu> Display for SigType<'tu> {
       Self::CallbackReturnValue { ret_ty_name, .. } => {
         write!(f, "ReturnValue<'s, {}>", ret_ty_name)
       }
+      Self::Struct { disposition, ty_name } => {
+        disposition.fmt(f)?;
+        ty_name.fmt(f)
+      }
       Self::Enum { ty_name } => write!(f, "{}", ty_name),
+      Self::ByteSlice { disposition, .. } => {
+        disposition.fmt(f)?;
+        write!(f, "[u8]")
+      }
       Self::Unknown(mut uty) => {
         eprint!("XX ?? {:?}", uty);
         while let Some(pty) = uty.get_pointee_type() {
+          eprint!(" ~> {:?}", pty);
           Disposition::new_ptr(pty).fmt(f)?;
           uty = pty;
         }
@@ -553,7 +582,7 @@ impl<'tu> Sig<'tu> {
         )
       }
       Sig { id: I::Return, ty } if ty.is_void() => {
-        format!("(\n{})", gen_rest(rest))
+        format!("(\n{}    )\n", gen_rest(rest))
       }
       Sig { id: I::Return, ty } => {
         format!("(\n{}    ) -> {}\n", gen_rest(rest), fmt_type(ty))
@@ -597,6 +626,15 @@ impl<'tu> Sig<'tu> {
         used_inputs.insert(info_var_name);
       }
       Sig {
+        ty: SigType::ByteSlice {
+          ptr_name, len_name, ..
+        },
+        ..
+      } => {
+        used_inputs.insert(ptr_name);
+        used_inputs.insert(len_name);
+      }
+      Sig {
         id: SigIdent::Param(Some(name)),
         ..
       } => {
@@ -622,13 +660,17 @@ impl<'tu> Sig<'tu> {
     match self {
       Sig {
         id: SigIdent::Param(Some(name)),
+        ty: SigType::Int { disposition, .. },
+      } | 
+      Sig {
+        id: SigIdent::Param(Some(name)),
         ty: SigType::Isolate { disposition },
       }
       | Sig {
         id: SigIdent::Param(Some(name)),
-        ty: SigType::PropertyDescriptor { disposition },
-      } => {
-        assert_ne!(disposition, &Disposition::Owned);
+        ty: SigType::Struct { disposition, .. },
+      }
+        if disposition.is_ptr() => {
         format!(
           "  let {} = unsafe {{ {}*{} }};\n{}",
           name,
@@ -678,6 +720,35 @@ impl<'tu> Sig<'tu> {
         info_var_name,
         gen_rest(rest)
       ),
+      Sig {
+        id: SigIdent::Param(Some(name)),
+        ty:
+          SigType::ByteSlice {
+            disposition,
+            ptr_name,
+            len_name,
+            needs_cast
+          },
+      } => {
+        let method = match disposition {
+          Disposition::Const => "from_raw_parts",
+          Disposition::Mut => "from_raw_parts_mut",
+          _ => unreachable!(),
+        };
+        let cast = match needs_cast {
+          true => format!(" as {:#} u8", disposition),
+          false => "".to_owned()
+        };
+        format!(
+          "  let {} = unsafe {{ slice::{}({}{}, {}) }};\n{}",
+          name,
+          method,
+          ptr_name,
+          cast,
+          len_name,
+          gen_rest(rest)
+        )
+      }
       _ => gen_rest(rest),
     }
   }
@@ -712,8 +783,24 @@ impl<'tu> From<Type<'tu>> for SigType<'tu> {
       }
     } else if ty.get_kind() == K::Bool {
       M::Bool
+    } else if let Some(pty) = ty
+      .get_pointee_type()
+      .filter(|pty| pty.get_kind() == K::UChar)
+    {
+      M::Char {
+        disposition: Disposition::new_ptr(pty),
+        signed: Some(false),
+      }
     } else if ty.get_kind() == K::Int {
-      M::Int { signed: true }
+      M::Int { disposition: Disposition::Owned, signed: true }
+    } else if let Some(pty) = ty
+      .get_pointee_type()
+      .filter(|pty| pty.get_kind() == K::Int)
+    {
+      M::Int {
+        disposition: Disposition::new_ptr(pty),
+        signed: true,
+      }
     } else if is_std_type(ty, "int32_t") {
       M::IntFixedSize {
         bits: 32,
@@ -772,13 +859,21 @@ impl<'tu> From<Type<'tu>> for SigType<'tu> {
         ty_name,
         ret_ty_name,
       }
-    } else if let Some(_ty) = is_v8_type(ty, "StartupData") {
-      M::StartupData
     } else if let Some(_ty) = is_v8_type(ty, "PromiseRejectMessage") {
       M::PromiseRejectMessage
+    } else if let Some(_ty) = is_v8_type(ty, "StartupData") {
+      M::Struct { ty_name: "StartupData".to_owned(), disposition: Disposition::Owned }
+    } else if let Some(pty) = is_v8_type_pointee(ty, "JitCodeEvent") {
+      M::Struct {
+        ty_name: "JitCodeEvent".to_owned(), disposition: Disposition::new_ptr(pty),
+      }    
     } else if let Some(pty) = is_v8_type_pointee(ty, "PropertyDescriptor") {
-      M::PropertyDescriptor {
-        disposition: Disposition::new_ptr(pty),
+      M::Struct {
+        ty_name: "PropertyDescriptor".to_owned(), disposition: Disposition::new_ptr(pty),
+      }
+    } else if let Some(pty) = is_v8_isolate_type_pointee(ty, "AtomicsWaitWakeHandle") {
+      M::Struct {
+        ty_name: "AtomicsWaitWakeHandle".to_owned(), disposition: Disposition::new_ptr(pty),
       }
     } else if ty.get_kind() == TypeKind::Enum && ty.get_sizeof().unwrap() == 4 {
       M::Enum {
@@ -950,6 +1045,8 @@ fn gather_raw_to_native_conversions<'tu>(sigs: &[Sig<'tu>]) -> String {
   gather_recursively_with(sigs.to_owned(), |first, rest| {
     first.gather_raw_to_native_conversions(rest)
   })
+  .trim_end()
+  .to_owned()
 }
 
 fn gather_used_inputs<'tu>(sigs_native: &[Sig<'tu>]) -> HashSet<String> {
@@ -1093,6 +1190,29 @@ fn convert_raw_signature_to_native<'tu>(sigs: &[Sig<'tu>]) -> Vec<Sig<'tu>> {
       }
       _ => once(sig).chain(None.into_iter()),
     })
+    // Find an adjacent set of two parameters: first a `*mut|*const c_void`, 
+    // followed by a `usize` parameter. Then second parameter must have `len`
+    // in its name to filter false positives.
+    .map(Some)
+    .chain(once(None))
+    .filter_map({ let mut prev_slot: Option<_> = None; move |sig: Option<_>| {
+      match (prev_slot.take(), sig) {
+        (Some(Sig { ty: SigType::Void { disposition }, id: SigIdent::Param(Some(ptr_name)) }),
+        Some(Sig { ty: SigType::IntPtrSize { signed: false}, id: SigIdent::Param(Some(len_name)) })) if disposition.is_ptr() && len_name.contains("len")   => {
+          let name = ptr_name.clone();
+          Some(Sig { ty: SigType::ByteSlice { disposition, ptr_name, len_name, needs_cast: true }, id: SigIdent::Param(Some(name)) })
+        }        
+        (Some(Sig { ty: SigType::Char { signed: Some(false), disposition }, id: SigIdent::Param(Some(ptr_name)) }),
+        Some(Sig { ty: SigType::IntPtrSize { signed: false}, id: SigIdent::Param(Some(len_name)) })) if disposition.is_ptr() && len_name.contains("len")   => {
+          let name = ptr_name.clone();
+          Some(Sig { ty: SigType::ByteSlice { disposition, ptr_name, len_name, needs_cast: false }, id: SigIdent::Param(Some(name)) })
+        }
+        (prev, sig) => {
+          prev_slot = sig;
+          prev
+        }
+      }
+    }})
     .collect::<Vec<_>>()
 }
 
@@ -1479,7 +1599,7 @@ fn visit_callback_definition<'tu>(
     use_win64fix,
   );
   if contains_unknown_cxx_types(&sigs_raw) {
-    // println!("{}", comment_out(code));
+    //println!("{}", comment_out(code));
   } else {
     println!("{}", code);
   }
@@ -1610,9 +1730,13 @@ fn boilerplate() -> &'static str {
 //! ```
 
 #![allow(clippy::needless_lifetimes)]
+#![allow(clippy::too_many_arguments)]
 
 use std::ffi::c_void;
 use std::os::raw::c_int;
+use std::os::raw::c_double;
+use std::os::raw::c_uchar;
+use std::slice;
 
 use crate::scope::CallbackScope;
 use crate::support::Opaque;
@@ -1636,11 +1760,14 @@ use crate::PropertyCallbackArguments;
 use crate::PropertyCallbackInfo;
 use crate::ReturnValue;
 use crate::ScriptOrModule;
+use crate::SharedArrayBuffer;
 use crate::StartupData;
 use crate::String;
 use crate::Value;
 
 // Placeholder types that don't have Rust bindings yet.
+#[repr(C)] pub struct AtomicsWaitWakeHandle(Opaque);
+#[repr(C)] pub struct JitCodeEvent(Opaque);
 #[repr(C)] pub struct PropertyDescriptor(Opaque);
 #[repr(C)] pub enum  AccessType { _TODO }
 #[repr(C)] pub enum  AtomicsWaitEvent { _TODO }
