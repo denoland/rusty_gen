@@ -218,7 +218,7 @@ fn get_type_params<'tu>(ty: Type<'tu>) -> Option<TypeParams<'tu>> {
   let pty2 = pty1.and_then(|_| ptys.next());
   let pty3 = pty2.and_then(|_| ptys.next());
   let info = match (pty1, pty2, pty3) {
-    (None, _, _) => TypeParams::Zero,
+    (None, ..) => TypeParams::Zero,
     (Some(p), None, _) => TypeParams::One(p?),
     (Some(p), Some(q), None) => TypeParams::Two(p?, q?),
     _ => panic!("More than 2 type parameters"),
@@ -259,6 +259,7 @@ enum SigIdent {
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 enum Disposition {
+  Cell,
   Const,
   Mut,
   Owned,
@@ -275,8 +276,16 @@ impl Disposition {
 
   pub fn is_ptr(self) -> bool {
     match self {
-      Self::Const | Self::Mut => true,
+      Self::Cell | Self::Const | Self::Mut => true,
       Self::Owned => false,
+    }
+  }
+
+  pub fn fmt_type(self, ty_name: impl Display, raw: bool) -> String {
+    match self {
+      Self::Cell if !raw => format!("&'static Cell<{}>", ty_name),
+      _ if raw => format!("{:#}{:#}", self, ty_name),
+      _ => format!("{}{}", self, ty_name),
     }
   }
 }
@@ -285,11 +294,11 @@ impl Display for Disposition {
   fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
     let raw = f.alternate();
     match self {
-      Self::Const if raw => write!(f, "*const "),
       Self::Mut if raw => write!(f, "*mut "),
       Self::Const => write!(f, "&"),
       Self::Mut => write!(f, "&mut "),
       Self::Owned => Ok(()),
+      Self::Cell => panic!("use Disposition::fmt_type"),
     }
   }
 }
@@ -321,6 +330,7 @@ enum SigType<'tu> {
   },
   CallbackScope {
     param: String,
+    with_context: bool,
   },
   Local {
     inner_ty: Type<'tu>,
@@ -394,11 +404,11 @@ impl<'tu> Display for SigType<'tu> {
       Self::Int {
         disposition,
         signed: false,
-      } => write!(f, "{}u32", disposition),
+      } => write!(f, "{}", disposition.fmt_type("u32", false)),
       Self::Int {
         disposition,
         signed: true,
-      } => write!(f, "{}i32", disposition),
+      } => write!(f, "{}", disposition.fmt_type("i32", false)),
       Self::IntFixedSize { bits, signed: true } => write!(f, "i{}", bits),
       Self::IntFixedSize {
         bits,
@@ -412,7 +422,13 @@ impl<'tu> Display for SigType<'tu> {
         disposition.fmt(f)?;
         write!(f, "Isolate")
       }
-      Self::CallbackScope { .. } => write!(f, "&mut HandleScope<'s>"),
+      Self::CallbackScope {
+        with_context: true, ..
+      } => write!(f, "&mut HandleScope<'s>"),
+      Self::CallbackScope {
+        with_context: false,
+        ..
+      } => write!(f, "&mut HandleScope<'s, ()>"),
       Self::Local { inner_ty_name, .. } => {
         write!(f, "Local<'s, {}>", inner_ty_name)
       }
@@ -453,12 +469,7 @@ impl<'tu> Display for SigType<'tu> {
           Disposition::new_ptr(pty).fmt(f)?;
           uty = pty;
         }
-        eprintln!(
-          "  sizeof={:?}  sz[]={:?}  fields={:?}",
-          uty.get_sizeof(),
-          uty.get_size(),
-          uty.get_fields()
-        );
+        eprintln!("  sizeof={:?}  sz[]={:?}", uty.get_sizeof(), uty.get_size(),);
         write!(
           f,
           "{}??",
@@ -574,7 +585,13 @@ impl<'tu> Sig<'tu> {
         })
         .unwrap_or_default()
     };
-    let fmt_separator = || if with_names && with_types { ": " } else { "" };
+    let fmt_separator = || {
+      if with_names && with_types {
+        ": "
+      } else {
+        ""
+      }
+    };
     let fmt_name_prefix = |v| {
       if used_inputs.map(|ui| !ui.contains(v)).unwrap_or_default() {
         "_"
@@ -663,7 +680,7 @@ impl<'tu> Sig<'tu> {
   {
     match self {
       Sig {
-        ty: SigType::CallbackScope { param },
+        ty: SigType::CallbackScope { param, .. },
         ..
       } => {
         used_inputs.insert(param);
@@ -702,7 +719,7 @@ impl<'tu> Sig<'tu> {
 
   fn gather_raw_to_native_conversions<R>(&self, rest: R) -> String
   where
-    R: Iterator<Item = Sig<'tu>>,
+    R: Clone + Iterator<Item = Sig<'tu>>,
   {
     let gen_rest = |mut rest: R| {
       let next = rest.next();
@@ -744,7 +761,7 @@ impl<'tu> Sig<'tu> {
       ),
       Sig {
         id: SigIdent::Param(Some(name)),
-        ty: SigType::CallbackScope { param },
+        ty: SigType::CallbackScope { param, .. },
       } => format!(
         "  let {} = &mut unsafe {{ CallbackScope::new({}) }};\n{}",
         name,
@@ -811,6 +828,34 @@ impl<'tu> Sig<'tu> {
           len_name,
           gen_rest(rest)
         )
+      }
+      Sig {
+        id: SigIdent::Return,
+        ty:
+          SigType::Int {
+            disposition: Disposition::Cell,
+            signed,
+          },
+      } => format!(
+        "{}.as_ptr()",
+        Sig {
+          id: SigIdent::Return,
+          ty: SigType::Int {
+            disposition: Disposition::Mut,
+            signed: *signed
+          }
+        }
+        .gather_raw_to_native_conversions(rest)
+      ),
+      sig @ Sig {
+        id: SigIdent::Return,
+        ..
+      } => {
+        let params = once(sig.clone()).chain(rest.clone()).collect::<Vec<_>>();
+        let call_params = generate_call_params(
+          &params, false, false, false, true, false, false, None,
+        );
+        format!("{}  (F::get()){}", gen_rest(rest), call_params)
       }
       _ => gen_rest(rest),
     }
@@ -1110,7 +1155,9 @@ fn generate_call_params<'tu>(
     });
   // BLERGH! ugly hack!
   if for_macro {
-    call_params = call_params.replace("'", "'__");
+    call_params = call_params
+      .replace("'", "'__")
+      .replace("'__static", "'static");
   }
   call_params
 }
@@ -1207,8 +1254,39 @@ fn convert_raw_signature_to_native<'tu>(sigs: &[Sig<'tu>]) -> Vec<Sig<'tu>> {
       })
     })
     .map(|param| Sig {
-      ty: SigType::CallbackScope { param },
+      ty: SigType::CallbackScope {
+        param,
+        with_context: true,
+      },
       id: "scope".into(),
+    })
+    // If any of the params or the return type has an `'s` (scope) lifetime,
+    // the last resort is to create a CallbackScope<'s, ()> from just the
+    // Isolate handle.
+    .or_else(|| {
+      let mut map = Default::default();
+      gather_recursively_with(sigs.to_owned(), |first, rest| {
+        first.gather_lifetimes(rest, &mut map, true, false)
+      });
+      map
+        .keys()
+        .next()
+        .into_iter()
+        .flat_map(|_| sigs.iter())
+        .find_map(|sig| match sig {
+          Sig {
+            ty: SigType::Isolate { .. },
+            id: SigIdent::Param(Some(name)),
+          } => Some(format!("{}*{}", Disposition::Mut, name)),
+          _ => None,
+        })
+        .map(|param| Sig {
+          ty: SigType::CallbackScope {
+            param: param.to_owned(),
+            with_context: false,
+          },
+          id: "scope".into(),
+        })
     });
 
   let has_scope = scope_param.is_some();
@@ -1216,9 +1294,17 @@ fn convert_raw_signature_to_native<'tu>(sigs: &[Sig<'tu>]) -> Vec<Sig<'tu>> {
   sigs
     .iter()
     .cloned()
+    .map(|sig| match sig {
+      // Change the return type to an &'static Cell if the function has a &mut i32
+      // output and no scope.
+        Sig { id: SigIdent::Return, ty: SigType::Int { disposition: Disposition::Mut, signed }} if !has_scope => {
+          Sig { id: SigIdent::Return, ty: SigType::Int { disposition: Disposition::Cell, signed }}
+        },
+        sig => sig
+    })
     .flat_map(move |sig| match sig {
       // Keep the return type at the beginning of the list.
-      // Insert the CallbackScope (if any) right after the return type.
+      // Insert the CallbackScopeCallbackScope (if any) right after the return type.
       Sig {
         id: SigIdent::Return,
         ..
@@ -1277,22 +1363,40 @@ fn convert_raw_signature_to_native<'tu>(sigs: &[Sig<'tu>]) -> Vec<Sig<'tu>> {
       }
       _ => once(sig).chain(None.into_iter()),
     })
-    // Find an adjacent set of two parameters: first a `*mut|*const c_void`, 
+    // Find an adjacent set of two parameters: first a `*mut|*const c_void`,
     // followed by a `usize` parameter. Then second parameter must have `len`
     // in its name to filter false positives.
     .map(Some)
     .chain(once(None))
     .filter_map({ let mut prev_slot: Option<_> = None; move |sig: Option<_>| {
       match (prev_slot.take(), sig) {
-        (Some(Sig { ty: SigType::Void { disposition }, id: SigIdent::Param(Some(ptr_name)) }),
-        Some(Sig { ty: SigType::IntPtrSize { signed: false}, id: SigIdent::Param(Some(len_name)) })) if disposition.is_ptr() && len_name.contains("len")   => {
+        (Some(Sig {
+          ty: SigType::Void { disposition },
+          id: SigIdent::Param(Some(ptr_name))
+        }),
+        Some(Sig {
+          ty: SigType::IntPtrSize { signed: false},
+          id: SigIdent::Param(Some(len_name))
+        })) if disposition.is_ptr() && len_name.contains("len") => {
           let name = ptr_name.clone();
-          Some(Sig { ty: SigType::ByteSlice { disposition, ptr_name, len_name, needs_cast: true }, id: SigIdent::Param(Some(name)) })
-        }        
-        (Some(Sig { ty: SigType::Char { signed: Some(false), disposition }, id: SigIdent::Param(Some(ptr_name)) }),
-        Some(Sig { ty: SigType::IntPtrSize { signed: false}, id: SigIdent::Param(Some(len_name)) })) if disposition.is_ptr() && len_name.contains("len")   => {
+          Some(Sig {
+            ty: SigType::ByteSlice { disposition, ptr_name, len_name, needs_cast: true },
+            id: SigIdent::Param(Some(name))
+          })
+        }
+        (Some(Sig {
+          ty: SigType::Char { signed: Some(false), disposition },
+          id: SigIdent::Param(Some(ptr_name))
+        }),
+        Some(Sig {
+          ty: SigType::IntPtrSize { signed: false},
+          id: SigIdent::Param(Some(len_name))
+        })) if disposition.is_ptr() && len_name.contains("len") => {
           let name = ptr_name.clone();
-          Some(Sig { ty: SigType::ByteSlice { disposition, ptr_name, len_name, needs_cast: false }, id: SigIdent::Param(Some(name)) })
+          Some(Sig {
+            ty: SigType::ByteSlice { disposition, ptr_name, len_name, needs_cast: false },
+            id: SigIdent::Param(Some(name))
+          })
         }
         (prev, sig) => {
           prev_slot = sig;
@@ -1415,7 +1519,7 @@ fn render_callback_definition<'tu>(
   );
   let call_param_types_raw_win64fix =
     generate_call_params(sigs_raw, true, true, true, false, false, false, None);
-  let call_param_names_native = generate_call_params(
+  let _call_param_names_native = generate_call_params(
     sigs_native,
     false,
     false,
@@ -1519,7 +1623,7 @@ macro_rules! impl_into_{cb_name_lc} {{
 type Raw{cb_name_uc} = {for_lifetimes_raw}extern "C" fn{call_param_types_raw};
 
 impl<F> From<F> for {cb_name_uc}
-where 
+where
   F: UnitType
     + {for_lifetimes_native}FnOnce{call_param_types_native}
 {{
@@ -1527,7 +1631,6 @@ where
     #[inline(always)]
     extern "C" fn adapter<{lifetimes_raw_comma}F: Into{cb_name_uc}>{call_params_full_raw} {{
       {raw_to_native_conversions}
-      (F::get()){call_param_names_native}
     }}
 
     Self(adapter::<F>)
@@ -1540,7 +1643,6 @@ where
       lifetimes_raw_comma = lifetimes_raw_comma,
       call_param_types_native = call_param_types_native,
       call_param_types_raw = call_param_types_raw,
-      call_param_names_native = call_param_names_native,
       call_params_full_raw = call_params_full_raw,
       raw_to_native_conversions = raw_to_native_conversions,
     )
@@ -1554,7 +1656,7 @@ type Raw{cb_name_uc} = {for_lifetimes_raw}extern "C" fn{call_param_types_raw};
 type Raw{cb_name_uc} = {for_lifetimes_raw}extern "C" fn{call_param_types_raw_win64fix};
 
 impl<F> From<F> for {cb_name_uc}
-  where 
+  where
     F: UnitType
       + {for_lifetimes_native}FnOnce{call_param_types_native}
 {{
@@ -1562,7 +1664,6 @@ impl<F> From<F> for {cb_name_uc}
     #[inline(always)]
     fn signature_adapter<{lifetimes_raw_comma}F: Into{cb_name_uc}>{call_params_full_raw} {{
       {raw_to_native_conversions}
-      (F::get()){call_param_names_native}
     }}
 
     #[cfg(target_family = "unix")]
@@ -1591,7 +1692,6 @@ impl<F> From<F> for {cb_name_uc}
       call_param_types_native = call_param_types_native,
       call_param_types_raw = call_param_types_raw,
       call_param_types_raw_win64fix = call_param_types_raw_win64fix,
-      call_param_names_native = call_param_names_native,
       call_param_names_raw = call_param_names_raw,
       call_params_full_raw = call_params_full_raw,
       call_params_full_raw_win64fix = call_params_full_raw_win64fix,
@@ -1610,7 +1710,7 @@ fn mock_{cb_name_lc}<{lifetimes_native}>{call_params_full_native_notused} {{
 fn {cb_name_lc}_type_param() {{
   fn pass_by_type_param<F: Into{cb_name_uc}>(_: F) -> {cb_name_uc} {{
     F::get().into()
-  }} 
+  }}
   let _ = pass_by_type_param(mock_{cb_name_lc});
 }}
 
@@ -1860,11 +1960,12 @@ fn boilerplate() -> &'static str {
 #![allow(clippy::needless_lifetimes)]
 #![allow(clippy::too_many_arguments)]
 
+use std::cell::Cell;
 use std::ffi::c_void;
 use std::ffi::CStr;
 use std::os::raw::c_char;
-use std::os::raw::c_int;
 use std::os::raw::c_double;
+use std::os::raw::c_int;
 use std::os::raw::c_uchar;
 use std::slice;
 
