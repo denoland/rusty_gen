@@ -294,6 +294,7 @@ impl Display for Disposition {
   fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
     let raw = f.alternate();
     match self {
+      Self::Const if raw => write!(f, "*const "),
       Self::Mut if raw => write!(f, "*mut "),
       Self::Const => write!(f, "&"),
       Self::Mut => write!(f, "&mut "),
@@ -329,7 +330,8 @@ enum SigType<'tu> {
     disposition: Disposition,
   },
   CallbackScope {
-    param: String,
+    param_var_name: String,
+    param_expression: String,
     with_context: bool,
   },
   Local {
@@ -680,10 +682,10 @@ impl<'tu> Sig<'tu> {
   {
     match self {
       Sig {
-        ty: SigType::CallbackScope { param, .. },
+        ty: SigType::CallbackScope { param_var_name, .. },
         ..
       } => {
-        used_inputs.insert(param);
+        used_inputs.insert(param_var_name);
       }
       Sig {
         ty: SigType::CallbackArguments { info_var_name, .. },
@@ -761,11 +763,13 @@ impl<'tu> Sig<'tu> {
       ),
       Sig {
         id: SigIdent::Param(Some(name)),
-        ty: SigType::CallbackScope { param, .. },
+        ty: SigType::CallbackScope {
+          param_expression, ..
+        },
       } => format!(
         "  let {} = &mut unsafe {{ CallbackScope::new({}) }};\n{}",
         name,
-        param,
+        param_expression,
         gen_rest(rest)
       ),
       Sig {
@@ -1227,8 +1231,10 @@ fn convert_raw_signature_to_native<'tu>(sigs: &[Sig<'tu>]) -> Vec<Sig<'tu>> {
     .find_map(|sig| match sig {
       Sig {
         ty: SigType::Local { inner_ty, .. },
-        id: SigIdent::Param(name),
-      } if type_has_base_class_in_v8_ns(inner_ty, "Context") => name.clone(),
+        id: SigIdent::Param(Some(name)),
+      } if type_has_base_class_in_v8_ns(inner_ty, "Context") => {
+        Some((name.clone(), name.clone(), true))
+      }
       _ => None,
     })
     // If no Local<Context> found, look for other options.
@@ -1236,29 +1242,22 @@ fn convert_raw_signature_to_native<'tu>(sigs: &[Sig<'tu>]) -> Vec<Sig<'tu>> {
       sigs.iter().find_map(|sig| match sig {
         Sig {
           ty: SigType::Local { inner_ty, .. },
-          id: SigIdent::Param(name),
+          id: SigIdent::Param(Some(name)),
         } if type_has_base_class_in_v8_ns(inner_ty, "Object")
           || type_has_base_class_in_v8_ns(inner_ty, "Message") =>
         {
-          name.clone()
+          Some((name.clone(), name.clone(), true))
         }
         Sig {
           ty: SigType::PromiseRejectMessage,
           id: SigIdent::Param(Some(name)),
-        } => Some(format!("&{}", &name)),
+        } => Some((name.clone(), format!("&{}", &name), true)),
         Sig {
           ty: SigType::CallbackInfo { .. },
           id: SigIdent::Param(Some(name)),
-        } => Some(format!("&*{}", &name)),
+        } => Some((name.clone(), format!("&*{}", &name), true)),
         _ => None,
       })
-    })
-    .map(|param| Sig {
-      ty: SigType::CallbackScope {
-        param,
-        with_context: true,
-      },
-      id: "scope".into(),
     })
     // If any of the params or the return type has an `'s` (scope) lifetime,
     // the last resort is to create a CallbackScope<'s, ()> from just the
@@ -1277,16 +1276,21 @@ fn convert_raw_signature_to_native<'tu>(sigs: &[Sig<'tu>]) -> Vec<Sig<'tu>> {
           Sig {
             ty: SigType::Isolate { .. },
             id: SigIdent::Param(Some(name)),
-          } => Some(format!("{}*{}", Disposition::Mut, name)),
+          } => Some((
+            name.clone(),
+            format!("{}*{}", Disposition::Mut, name),
+            false,
+          )),
           _ => None,
         })
-        .map(|param| Sig {
-          ty: SigType::CallbackScope {
-            param: param.to_owned(),
-            with_context: false,
-          },
-          id: "scope".into(),
-        })
+    })
+    .map(|(param_var_name, param_expression, with_context)| Sig {
+      ty: SigType::CallbackScope {
+        param_var_name,
+        param_expression,
+        with_context,
+      },
+      id: "scope".into(),
     });
 
   let has_scope = scope_param.is_some();
