@@ -1,9 +1,9 @@
 #![allow(dead_code)]
 
 use clang::*;
-use linked_hash_map::LinkedHashMap;
-use linked_hash_set::LinkedHashSet;
+use std::borrow::Cow;
 use std::collections::HashSet;
+use std::convert::AsRef;
 use std::fmt::{self, Display, Formatter};
 use std::hash::Hash;
 use std::io;
@@ -257,53 +257,6 @@ enum SigIdent {
   Param(Option<String>),
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
-enum Disposition {
-  Cell,
-  Const,
-  Mut,
-  Owned,
-}
-
-impl Disposition {
-  pub fn new_ptr(pointee_ty: Type<'_>) -> Self {
-    if pointee_ty.is_const_qualified() {
-      Self::Const
-    } else {
-      Self::Mut
-    }
-  }
-
-  pub fn is_ptr(self) -> bool {
-    match self {
-      Self::Cell | Self::Const | Self::Mut => true,
-      Self::Owned => false,
-    }
-  }
-
-  pub fn fmt_type(self, ty_name: impl Display, raw: bool) -> String {
-    match self {
-      Self::Cell if !raw => format!("&'static Cell<{}>", ty_name),
-      _ if raw => format!("{:#}{:#}", self, ty_name),
-      _ => format!("{}{}", self, ty_name),
-    }
-  }
-}
-
-impl Display for Disposition {
-  fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-    let raw = f.alternate();
-    match self {
-      Self::Const if raw => write!(f, "*const "),
-      Self::Mut if raw => write!(f, "*mut "),
-      Self::Const => write!(f, "&"),
-      Self::Mut => write!(f, "&mut "),
-      Self::Owned => Ok(()),
-      Self::Cell => panic!("use Disposition::fmt_type"),
-    }
-  }
-}
-
 #[derive(Debug, Clone)]
 enum SigType<'tu> {
   Void {
@@ -373,112 +326,427 @@ enum SigType<'tu> {
   Unknown(Type<'tu>),
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum Lifetime {
+  Anon,
+  Named(Cow<'static, str>),
+  Static,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+enum Disposition {
+  Owned,
+  ConstAuto,
+  MutAuto,
+  Cell,
+  ConstRef,
+  MutRef,
+  ConstPtr,
+  MutPtr,
+}
+
+impl Default for Disposition {
+  fn default() -> Self {
+    Self::Owned
+  }
+}
+
+impl Disposition {
+  pub fn auto(pointee_ty: Type<'_>) -> Self {
+    if pointee_ty.is_const_qualified() {
+      Self::ConstAuto
+    } else {
+      Self::MutAuto
+    }
+  }
+
+  pub fn as_set_raw(self, raw: bool) -> Self {
+    match self {
+      Self::ConstAuto if raw => Self::ConstPtr,
+      Self::ConstAuto if !raw => Self::ConstRef,
+      Self::MutAuto if raw => Self::MutPtr,
+      Self::MutAuto if !raw => Self::MutRef,
+      other => other,
+    }
+  }
+
+  pub fn as_native(self) -> Self {
+    self.as_set_raw(false)
+  }
+
+  pub fn as_raw(self) -> Self {
+    self.as_set_raw(true)
+  }
+
+  pub fn is_owned(self) -> bool {
+    match self {
+      Self::Owned => true,
+      _ => false,
+    }
+  }
+
+  pub fn is_address(self) -> bool {
+    match self {
+      Self::Owned => false,
+      _ => true,
+    }
+  }
+
+  pub fn is_const_address(self) -> bool {
+    match self {
+      Self::ConstAuto | Self::ConstRef | Self::ConstPtr => true,
+      _ => false,
+    }
+  }
+
+  pub fn is_mut_address(self) -> bool {
+    match self {
+      Self::MutAuto | Self::MutRef | Self::MutPtr => true,
+      _ => false,
+    }
+  }
+
+  pub fn fmt_type(self, ty_name: impl Display, raw: bool) -> String {
+    match self {
+      Self::Cell if !raw => format!("&'static Cell<{}>", ty_name),
+      _ if raw => format!("{:#}{:#}", self, ty_name),
+      _ => format!("{}{}", self, ty_name),
+    }
+  }
+}
+
+impl Display for Disposition {
+  fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    match self {
+      Self::ConstAuto | Self::MutAuto => {
+        write!(f, "{}", self.as_set_raw(f.alternate()))
+      }
+      Self::ConstRef => write!(f, "&"),
+      Self::MutRef => write!(f, "&mut "),
+      Self::ConstPtr => write!(f, "*const "),
+      Self::MutPtr => write!(f, "*mut "),
+      Self::Owned => Ok(()),
+      Self::Cell => panic!("use Disposition::fmt_type"),
+    }
+  }
+}
+
+impl From<&'static str> for Lifetime {
+  fn from(name: &'static str) -> Self {
+    Self::Named(name.into())
+  }
+}
+
+impl Display for Lifetime {
+  fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    match self {
+      Self::Anon => write!(f, "'_"),
+      Self::Named(name) => write!(f, "'{}", name),
+      Self::Static => write!(f, "'static"),
+    }
+  }
+}
+
+#[derive(Default)]
+struct TypeInfo {
+  pub disposition: Disposition,
+  pub name: Cow<'static, str>,
+  pub lifetimes: Vec<Lifetime>,
+  pub type_args: Vec<TypeInfo>,
+  pub win64_return_value_on_stack: bool,
+}
+
+impl Display for TypeInfo {
+  fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    let angle_bracket_params = self
+      .lifetimes
+      .iter()
+      .map(|l| l.to_string())
+      .chain(self.type_args.iter().map(|p| p.to_string()))
+      .collect::<Vec<_>>()
+      .join(", ");
+    let name_and_params = if angle_bracket_params.is_empty() {
+      format!("{}", self.name)
+    } else {
+      format!("{}<{}>", self.name, angle_bracket_params)
+    };
+    write!(
+      f,
+      "{}",
+      self.disposition.fmt_type(name_and_params, f.alternate()),
+    )?;
+    Ok(())
+  }
+}
+
+impl TypeInfo {
+  fn from(sig: &SigType, raw: bool) -> TypeInfo {
+    use Disposition as D;
+    use SigType as S;
+    use TypeInfo as I;
+    match sig {
+      S::Void {
+        disposition: D::Owned,
+      } => I {
+        name: "()".into(),
+        ..I::default()
+      },
+      S::Void { disposition } => I {
+        disposition: disposition.as_raw(),
+        name: "c_void".into(),
+        ..I::default()
+      },
+      S::Bool => I {
+        name: "bool".into(),
+        ..I::default()
+      },
+      S::Char {
+        signed: None,
+        disposition,
+      } if raw => I {
+        disposition: disposition.as_raw(),
+        name: "c_char".into(),
+        ..I::default()
+      },
+      S::Char {
+        signed: None,
+        disposition,
+      } if !raw => I {
+        disposition: disposition.as_native(),
+        name: "str".into(),
+        ..I::default()
+      },
+      S::Char {
+        signed: Some(false),
+        disposition,
+      } if raw => I {
+        disposition: disposition.as_raw(),
+        name: "c_uchar".into(),
+        ..I::default()
+      },
+      S::Char { .. } => unreachable!(),
+      S::Int {
+        signed: false,
+        disposition,
+      } if raw => I {
+        disposition: disposition.as_raw(),
+        name: "c_uint".into(),
+        ..I::default()
+      },
+      S::Int {
+        signed: false,
+        disposition,
+      } if !raw => I {
+        disposition: disposition.as_native(),
+        name: "u32".into(),
+        ..I::default()
+      },
+      S::Int {
+        signed: true,
+        disposition,
+      } if raw => I {
+        disposition: disposition.as_raw(),
+        name: "c_int".into(),
+        ..I::default()
+      },
+      S::Int {
+        signed: true,
+        disposition,
+      } if !raw => I {
+        disposition: disposition.as_native(),
+        name: "i32".into(),
+        ..I::default()
+      },
+      S::Int { .. } => unreachable!(),
+      S::IntFixedSize {
+        signed: false,
+        bits,
+      } => I {
+        name: format!("u{}", bits).into(),
+        ..I::default()
+      },
+      S::IntFixedSize { signed: true, bits } => I {
+        name: format!("i{}", bits).into(),
+        ..I::default()
+      },
+      S::IntPtrSize { signed: false } => I {
+        name: "usize".into(),
+        ..I::default()
+      },
+      S::IntPtrSize { signed: true } => I {
+        name: "isize".into(),
+        ..I::default()
+      },
+      S::Double if raw => I {
+        name: "c_double".into(),
+        ..I::default()
+      },
+      S::Double => I {
+        name: "f64".into(),
+        ..I::default()
+      },
+      S::Isolate { disposition } => I {
+        disposition: disposition.as_set_raw(raw),
+        name: "Isolate".into(),
+        ..I::default()
+      },
+      S::CallbackScope { with_context, .. } => I {
+        disposition: D::MutRef,
+        name: "HandleScope".into(),
+        lifetimes: vec!["s".into()],
+        type_args: once(I {
+          name: "()".into(),
+          ..I::default()
+        })
+        .filter(|_| !with_context)
+        .collect(),
+        ..I::default()
+      },
+      S::Local { inner_ty_name, .. } => I {
+        name: "Local".into(),
+        lifetimes: vec!["s".into()],
+        type_args: vec![I {
+          name: inner_ty_name.clone().into(),
+          ..I::default()
+        }],
+        win64_return_value_on_stack: true,
+        ..I::default()
+      },
+      S::MaybeLocal { inner_ty_name, .. } => I {
+        name: "Option".into(),
+        type_args: vec![I {
+          name: "Local".into(),
+          lifetimes: vec!["s".into()],
+          type_args: vec![I {
+            name: inner_ty_name.clone().into(),
+            ..I::default()
+          }],
+          ..I::default()
+        }],
+        win64_return_value_on_stack: true,
+        ..I::default()
+      },
+      S::ModifyCodeGenerationFromStringsResult => I {
+        name: "ModifyCodeGenerationFromStringsResult".into(),
+        lifetimes: vec!["s".into()],
+        win64_return_value_on_stack: true,
+        ..I::default()
+      },
+      S::PromiseRejectMessage => I {
+        name: "PromiseRejectMessage".into(),
+        lifetimes: vec!["s".into()],
+        ..I::default()
+      },
+      S::CallbackInfo { ty_name, .. } => I {
+        disposition: D::ConstPtr,
+        name: ty_name.clone().into(),
+        ..I::default()
+      },
+      S::CallbackArguments { ty_name, .. } => I {
+        name: ty_name.clone().into(),
+        lifetimes: vec!["s".into()],
+        ..I::default()
+      },
+      S::CallbackReturnValue { ret_ty_name, .. } => I {
+        name: "ReturnValue".into(),
+        lifetimes: vec!["s".into()],
+        type_args: vec![I {
+          name: ret_ty_name.clone().into(),
+          ..I::default()
+        }],
+        ..I::default()
+      },
+      S::Struct {
+        disposition,
+        ty_name,
+      } => I {
+        disposition: disposition.as_set_raw(raw),
+        name: ty_name.clone().into(),
+        ..I::default()
+      },
+      S::Enum { ty_name } => I {
+        name: ty_name.clone().into(),
+        ..I::default()
+      },
+      S::ByteSlice { disposition, .. } => I {
+        disposition: disposition.as_native(),
+        name: "[u8]".into(),
+        ..I::default()
+      },
+      S::Unknown(ty) => {
+        eprintln!("T?? {}", ty.get_display_name());
+        I {
+          name: format!("T??`{}`", ty.get_display_name()).into(),
+          ..I::default()
+        }
+      }
+    }
+  }
+}
+
+fn collect_named_lifetime_params<I>(type_infos: I) -> Vec<Lifetime>
+where
+  I: IntoIterator<Item = TypeInfo>,
+{
+  let mut set = HashSet::new();
+  type_infos
+    .into_iter()
+    .flat_map(|ti| {
+      ti.lifetimes
+        .clone()
+        .into_iter()
+        .filter_map(|lt| match lt {
+          lt @ Lifetime::Named(_) => Some(lt),
+          _ => None,
+        })
+        .chain(collect_named_lifetime_params(ti.type_args).into_iter())
+    })
+    .filter(|name| set.insert(name.clone()))
+    .collect::<Vec<_>>()
+}
+
+fn generate_angle_bracket_params<'tu>(
+  sigs: &[Sig<'tu>],
+  include_return_type: bool,
+  raw: bool,
+  for_macro: bool,
+  wrap_fn: impl Fn(String) -> String,
+) -> String {
+  let type_infos = sigs
+    .iter()
+    .filter_map(|sig| match sig {
+      Sig {
+        id: SigIdent::Param(_),
+        ty,
+      } => Some(ty),
+      Sig {
+        id: SigIdent::Return,
+        ty,
+      } if include_return_type => Some(ty),
+      _ => None,
+    })
+    .map(|ty| TypeInfo::from(ty, raw));
+  let mut lifetimes = collect_named_lifetime_params(type_infos)
+    .into_iter()
+    .map(|lt| lt.to_string())
+    .collect::<Vec<_>>()
+    .join(", ");
+  if lifetimes.is_empty() {
+    lifetimes
+  } else {
+    if for_macro {
+      lifetimes = lifetimes
+        .replace("'s", "'__s")
+        .replace("'__static", "'static");
+    }
+    wrap_fn(lifetimes)
+  }
+}
+
 impl<'tu> Display for SigType<'tu> {
   fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
     let raw = f.alternate();
-    match self {
-      Self::Void {
-        disposition: Disposition::Owned,
-      } => write!(f, "()"),
-      Self::Void { disposition } => write!(f, "{:#}c_void", disposition),
-      Self::Bool => write!(f, "bool"),
-      Self::Char {
-        signed: None,
-        disposition: Disposition::Const,
-      } if raw => write!(f, "{:#}c_char", Disposition::Const),
-      Self::Char {
-        signed: None,
-        disposition: Disposition::Const,
-      } => write!(f, "{}str", Disposition::Const),
-      Self::Char {
-        signed: Some(false),
-        disposition,
-      } if raw => write!(f, "{:#}c_uchar", disposition),
-      Self::Char { .. } => unreachable!(),
-      Self::Int {
-        disposition,
-        signed: false,
-      } if raw => write!(f, "{:#}c_uint", disposition),
-      Self::Int {
-        disposition,
-        signed: true,
-      } if raw => write!(f, "{:#}c_int", disposition),
-      Self::Int {
-        disposition,
-        signed: false,
-      } => write!(f, "{}", disposition.fmt_type("u32", false)),
-      Self::Int {
-        disposition,
-        signed: true,
-      } => write!(f, "{}", disposition.fmt_type("i32", false)),
-      Self::IntFixedSize { bits, signed: true } => write!(f, "i{}", bits),
-      Self::IntFixedSize {
-        bits,
-        signed: false,
-      } => write!(f, "u{}", bits),
-      Self::IntPtrSize { signed: true } => write!(f, "isize"),
-      Self::IntPtrSize { signed: false } => write!(f, "usize"),
-      Self::Double if raw => write!(f, "c_double"),
-      Self::Double => write!(f, "f64"),
-      Self::Isolate { disposition } => {
-        disposition.fmt(f)?;
-        write!(f, "Isolate")
-      }
-      Self::CallbackScope {
-        with_context: true, ..
-      } => write!(f, "&mut HandleScope<'s>"),
-      Self::CallbackScope {
-        with_context: false,
-        ..
-      } => write!(f, "&mut HandleScope<'s, ()>"),
-      Self::Local { inner_ty_name, .. } => {
-        write!(f, "Local<'s, {}>", inner_ty_name)
-      }
-      Self::MaybeLocal { inner_ty_name } => {
-        write!(f, "Option<Local<'s, {}>>", inner_ty_name)
-      }
-      Self::ModifyCodeGenerationFromStringsResult => {
-        write!(f, "ModifyCodeGenerationFromStringsResult<'s>")
-      }
-      Self::PromiseRejectMessage => write!(f, "PromiseRejectMessage<'s>"),
-      Self::CallbackInfo { ty_name, .. } => {
-        write!(f, "{:#}{}", Disposition::Const, ty_name)
-      }
-      Self::CallbackArguments { ty_name, .. } => write!(f, "{}<'s>", ty_name),
-      Self::CallbackReturnValue { ret_ty_name, .. } => {
-        write!(f, "ReturnValue<'s, {}>", ret_ty_name)
-      }
-      Self::Struct {
-        disposition,
-        ty_name,
-      } => {
-        disposition.fmt(f)?;
-        ty_name.fmt(f)
-      }
-      Self::Enum { ty_name } => write!(f, "{}", ty_name),
-      Self::ByteSlice { disposition, .. } => {
-        disposition.fmt(f)?;
-        write!(f, "[u8]")
-      }
-      Self::Unknown(mut uty) => {
-        eprint!("XX ?? {:?}", uty);
-        while let Some(pty) = uty.get_pointee_type().or_else(|| {
-          Some(uty)
-            .map(|uty| uty.get_canonical_type())
-            .filter(|&cty| cty != uty)
-        }) {
-          eprint!(" ~> {:?}", pty);
-          Disposition::new_ptr(pty).fmt(f)?;
-          uty = pty;
-        }
-        eprintln!("  sizeof={:?}  sz[]={:?}", uty.get_sizeof(), uty.get_size(),);
-        write!(
-          f,
-          "{}??",
-          get_type_name(uty).unwrap_or_else(|| uty.get_display_name())
-        )
-      }
-    }
+    write!(f, "{}", TypeInfo::from(self, raw))
   }
 }
 
@@ -496,65 +764,6 @@ impl<'tu> Sig<'tu> {
     Self {
       id: SigIdent::Return,
       ty: ret_ty.into(),
-    }
-  }
-
-  fn gather_lifetimes(
-    &self,
-    mut rest: impl Iterator<Item = Sig<'tu>>,
-    lifetimes: &mut LinkedHashMap<String, LinkedHashSet<String>>,
-    raw: bool,
-    for_macro: bool,
-  ) {
-    match self.ty {
-      SigType::CallbackScope { .. }
-      | SigType::Local { .. }
-      | SigType::MaybeLocal { .. }
-      | SigType::ModifyCodeGenerationFromStringsResult { .. }
-      | SigType::PromiseRejectMessage
-      | SigType::CallbackArguments { .. }
-      | SigType::CallbackReturnValue { .. } => {
-        let lifetime = if for_macro { "'__s" } else { "'s" };
-        if !lifetimes.contains_key(lifetime) {
-          lifetimes.insert(lifetime.to_owned(), Default::default());
-        }
-      }
-      _ => {}
-    }
-    if let Some(next) = rest.next() {
-      next.gather_lifetimes(rest, lifetimes, raw, for_macro);
-    }
-  }
-
-  fn gather_type_params(
-    &self,
-    mut rest: impl Iterator<Item = Sig<'tu>>,
-    type_params: &mut LinkedHashMap<String, LinkedHashSet<String>>,
-    raw: bool,
-  ) {
-    match self.ty {
-      _ => {}
-    }
-    if let Some(next) = rest.next() {
-      next.gather_type_params(rest, type_params, raw);
-    }
-  }
-
-  pub fn is_return_value_that_requires_win64_stack_return_fix(&self) -> bool {
-    match self {
-      Sig {
-        id: SigIdent::Return,
-        ty: SigType::Local { .. },
-      }
-      | Sig {
-        id: SigIdent::Return,
-        ty: SigType::MaybeLocal { .. },
-      }
-      | Sig {
-        id: SigIdent::Return,
-        ty: SigType::ModifyCodeGenerationFromStringsResult,
-      } => true,
-      _ => false,
     }
   }
 
@@ -741,7 +950,7 @@ impl<'tu> Sig<'tu> {
       | Sig {
         id: SigIdent::Param(Some(name)),
         ty: SigType::Struct { disposition, .. },
-      } if disposition.is_ptr() => format!(
+      } if disposition.is_address() => format!(
         "  let {} = unsafe {{ {}*{} }};\n{}",
         name,
         disposition,
@@ -752,10 +961,10 @@ impl<'tu> Sig<'tu> {
         id: SigIdent::Param(Some(name)),
         ty:
           SigType::Char {
-            disposition: Disposition::Const,
+            disposition,
             signed: None,
           },
-      } => format!(
+      } if disposition.is_const_address() => format!(
         "  let {} = unsafe {{ CStr::from_ptr({}) }}.to_str().unwrap();\n{}",
         name,
         name,
@@ -814,9 +1023,9 @@ impl<'tu> Sig<'tu> {
             needs_cast,
           },
       } => {
-        let method = match disposition {
-          Disposition::Const => "from_raw_parts",
-          Disposition::Mut => "from_raw_parts_mut",
+        let method = match disposition.as_native() {
+          Disposition::ConstRef => "from_raw_parts",
+          Disposition::MutRef => "from_raw_parts_mut",
           _ => unreachable!(),
         };
         let cast = match needs_cast {
@@ -845,7 +1054,7 @@ impl<'tu> Sig<'tu> {
         Sig {
           id: SigIdent::Return,
           ty: SigType::Int {
-            disposition: Disposition::Mut,
+            disposition: Disposition::MutPtr,
             signed: *signed
           }
         }
@@ -891,7 +1100,7 @@ impl<'tu> From<Type<'tu>> for SigType<'tu> {
       ty.get_pointee_type().filter(|&pty| is_void_type(pty))
     {
       M::Void {
-        disposition: Disposition::new_ptr(pty),
+        disposition: Disposition::auto(pty),
       }
     } else if ty.get_kind() == K::Bool {
       M::Bool
@@ -902,7 +1111,7 @@ impl<'tu> From<Type<'tu>> for SigType<'tu> {
       })
     {
       M::Char {
-        disposition: Disposition::new_ptr(pty),
+        disposition: Disposition::auto(pty),
         signed: None,
       }
     } else if let Some(pty) = ty
@@ -910,7 +1119,7 @@ impl<'tu> From<Type<'tu>> for SigType<'tu> {
       .filter(|pty| pty.get_kind() == K::UChar)
     {
       M::Char {
-        disposition: Disposition::new_ptr(pty),
+        disposition: Disposition::auto(pty),
         signed: Some(false),
       }
     } else if ty.get_kind() == K::Int {
@@ -922,7 +1131,7 @@ impl<'tu> From<Type<'tu>> for SigType<'tu> {
       ty.get_pointee_type().filter(|pty| pty.get_kind() == K::Int)
     {
       M::Int {
-        disposition: Disposition::new_ptr(pty),
+        disposition: Disposition::auto(pty),
         signed: true,
       }
     } else if is_std_type(ty, "int32_t") {
@@ -966,7 +1175,7 @@ impl<'tu> From<Type<'tu>> for SigType<'tu> {
       }
     } else if let Some(pty) = is_v8_type_pointee(ty, "Isolate") {
       M::Isolate {
-        disposition: Disposition::new_ptr(pty),
+        disposition: Disposition::auto(pty),
       }
     } else if let Some(ty2) = is_v8_type_pointee(ty, "FunctionCallbackInfo")
       .or_else(|| is_v8_type_pointee(ty, "PropertyCallbackInfo"))
@@ -997,19 +1206,19 @@ impl<'tu> From<Type<'tu>> for SigType<'tu> {
     } else if let Some(pty) = is_v8_type_pointee(ty, "JitCodeEvent") {
       M::Struct {
         ty_name: "JitCodeEvent".to_owned(),
-        disposition: Disposition::new_ptr(pty),
+        disposition: Disposition::auto(pty),
       }
     } else if let Some(pty) = is_v8_type_pointee(ty, "PropertyDescriptor") {
       M::Struct {
         ty_name: "PropertyDescriptor".to_owned(),
-        disposition: Disposition::new_ptr(pty),
+        disposition: Disposition::auto(pty),
       }
     } else if let Some(pty) =
       is_v8_isolate_type_pointee(ty, "AtomicsWaitWakeHandle")
     {
       M::Struct {
         ty_name: "AtomicsWaitWakeHandle".to_owned(),
-        disposition: Disposition::new_ptr(pty),
+        disposition: Disposition::auto(pty),
       }
     } else if ty.get_kind() == TypeKind::Enum && ty.get_sizeof().unwrap() == 4 {
       M::Enum {
@@ -1040,7 +1249,7 @@ impl<'tu> SigType<'tu> {
 
   fn is_void_ptr(&self) -> bool {
     match self {
-      Self::Void { disposition } => disposition.is_ptr(),
+      Self::Void { disposition } => disposition.is_address(),
       _ => false,
     }
   }
@@ -1059,79 +1268,6 @@ fn gather_recursively_with<
     f(first, rest)
   } else {
     Default::default()
-  }
-}
-
-fn add_angle_bracket_param<N, I>(
-  map: &mut LinkedHashMap<String, LinkedHashSet<String>>,
-  name: N,
-  constraints: I,
-) where
-  N: AsRef<str>,
-  I: IntoIterator,
-  I::Item: AsRef<str>,
-{
-  let name = name.as_ref();
-  if !map.contains_key(name) {
-    let r = map.insert(name.to_owned(), Default::default());
-    assert!(r.is_none());
-  }
-  let val = map.get_mut(name).unwrap();
-  for c in constraints {
-    let c = c.as_ref();
-    if !val.contains(c) {
-      let r = val.insert(c.to_owned());
-      assert!(!r);
-    }
-  }
-}
-
-fn generate_angle_bracket_params<'tu>(
-  sigs: &[Sig<'tu>],
-  raw: bool,
-  with_lifetimes: bool,
-  with_type_params: bool,
-  include_unconstrained: bool,
-  include_constraints: bool,
-  for_macro: bool,
-  wrap_fn: impl Fn(String) -> String,
-) -> String {
-  let mut map = LinkedHashMap::<String, LinkedHashSet<String>>::new();
-  if with_lifetimes {
-    gather_recursively_with(sigs.to_owned(), |first, rest| {
-      first.gather_lifetimes(rest, &mut map, raw, for_macro)
-    });
-  }
-  if with_type_params {
-    gather_recursively_with(sigs.to_owned(), |first, rest| {
-      first.gather_type_params(rest, &mut map, raw)
-    });
-  }
-  let s = if !include_constraints {
-    assert!(include_unconstrained);
-    map
-      .into_iter()
-      .map(|(k, _)| k)
-      .collect::<Vec<_>>()
-      .join(", ")
-  } else {
-    map
-      .into_iter()
-      .filter(|(_, v)| !v.is_empty() || include_unconstrained)
-      .map(|(k, v)| {
-        if v.is_empty() {
-          k
-        } else {
-          format!("{}: {}", k, v.into_iter().collect::<Vec<_>>().join(" + "))
-        }
-      })
-      .collect::<Vec<_>>()
-      .join(", ")
-  };
-  if !s.is_empty() {
-    wrap_fn(s)
-  } else {
-    s
   }
 }
 
@@ -1263,26 +1399,26 @@ fn convert_raw_signature_to_native<'tu>(sigs: &[Sig<'tu>]) -> Vec<Sig<'tu>> {
     // the last resort is to create a CallbackScope<'s, ()> from just the
     // Isolate handle.
     .or_else(|| {
-      let mut map = Default::default();
-      gather_recursively_with(sigs.to_owned(), |first, rest| {
-        first.gather_lifetimes(rest, &mut map, true, false)
-      });
-      map
-        .keys()
-        .next()
-        .into_iter()
-        .flat_map(|_| sigs.iter())
-        .find_map(|sig| match sig {
-          Sig {
-            ty: SigType::Isolate { .. },
-            id: SigIdent::Param(Some(name)),
-          } => Some((
-            name.clone(),
-            format!("{}*{}", Disposition::Mut, name),
-            false,
-          )),
-          _ => None,
-        })
+      let has_lifetimes = !collect_named_lifetime_params(
+        sigs.iter().map(|sig| TypeInfo::from(&sig.ty, true)),
+      )
+      .is_empty();
+      if !has_lifetimes {
+        return None;
+      }
+
+      // Confirmed that there are lifetimes.
+      sigs.iter().find_map(|d| match d {
+        Sig {
+          ty: SigType::Isolate { .. },
+          id: SigIdent::Param(Some(name)),
+        } => Some((
+          name.clone(),
+          format!("{}*{}", Disposition::MutRef, name),
+          false,
+        )),
+        _ => None,
+      })
     })
     .map(|(param_var_name, param_expression, with_context)| Sig {
       ty: SigType::CallbackScope {
@@ -1301,10 +1437,10 @@ fn convert_raw_signature_to_native<'tu>(sigs: &[Sig<'tu>]) -> Vec<Sig<'tu>> {
     .map(|sig| match sig {
       // Change the return type to an &'static Cell if the function has a &mut i32
       // output and no scope.
-        Sig { id: SigIdent::Return, ty: SigType::Int { disposition: Disposition::Mut, signed }} if !has_scope => {
-          Sig { id: SigIdent::Return, ty: SigType::Int { disposition: Disposition::Cell, signed }}
-        },
-        sig => sig
+      Sig { id: SigIdent::Return, ty: SigType::Int { disposition, signed }} if disposition.is_mut_address() && !has_scope => {
+        Sig { id: SigIdent::Return, ty: SigType::Int { disposition: Disposition::Cell, signed }}
+      },
+      sig => sig
     })
     .flat_map(move |sig| match sig {
       // Keep the return type at the beginning of the list.
@@ -1381,7 +1517,7 @@ fn convert_raw_signature_to_native<'tu>(sigs: &[Sig<'tu>]) -> Vec<Sig<'tu>> {
         Some(Sig {
           ty: SigType::IntPtrSize { signed: false},
           id: SigIdent::Param(Some(len_name))
-        })) if disposition.is_ptr() && len_name.contains("len") => {
+        })) if disposition.is_address() && len_name.contains("len") => {
           let name = ptr_name.clone();
           Some(Sig {
             ty: SigType::ByteSlice { disposition, ptr_name, len_name, needs_cast: true },
@@ -1395,7 +1531,7 @@ fn convert_raw_signature_to_native<'tu>(sigs: &[Sig<'tu>]) -> Vec<Sig<'tu>> {
         Some(Sig {
           ty: SigType::IntPtrSize { signed: false},
           id: SigIdent::Param(Some(len_name))
-        })) if disposition.is_ptr() && len_name.contains("len") => {
+        })) if disposition.is_address() && len_name.contains("len") => {
           let name = ptr_name.clone();
           Some(Sig {
             ty: SigType::ByteSlice { disposition, ptr_name, len_name, needs_cast: false },
@@ -1416,8 +1552,17 @@ fn return_value_requires_win64_stack_return_fix<'tu>(
 ) -> bool {
   sigs
     .iter()
-    .find(|sig| sig.is_return_value_that_requires_win64_stack_return_fix())
-    .is_some()
+    .filter_map(|sig| match sig {
+      Sig {
+        id: SigIdent::Return,
+        ty,
+      } => Some(ty),
+      _ => None,
+    })
+    .map(|ty| TypeInfo::from(ty, true))
+    .map(|ti| ti.win64_return_value_on_stack)
+    .next()
+    .unwrap()
 }
 
 fn format_comment(comment: &str) -> String {
@@ -1448,56 +1593,28 @@ fn render_callback_definition<'tu>(
   let cb_comment = cb_comment
     .map(format_comment)
     .unwrap_or_else(|| format!("// === {} ===\n", &cb_name_uc));
-  let for_lifetimes_native = generate_angle_bracket_params(
-    sigs_native,
-    false,
-    true,
-    false,
-    true,
-    false,
-    false,
-    |s| format!("for<{}> ", s),
-  );
-  let for_lifetimes_native_for_macro = generate_angle_bracket_params(
-    sigs_native,
-    false,
-    true,
-    false,
-    true,
-    false,
-    true,
-    |s| format!("for<{}> ", s),
-  );
-  let lifetimes_native = generate_angle_bracket_params(
-    sigs_native,
-    false,
-    true,
-    false,
-    true,
-    false,
-    false,
-    |s| s,
-  );
-  let for_lifetimes_raw = generate_angle_bracket_params(
-    sigs_raw,
-    true,
-    true,
-    false,
-    true,
-    false,
-    false,
-    |s| format!("for<{}> ", s),
-  );
-  let lifetimes_raw_comma = generate_angle_bracket_params(
-    sigs_raw,
-    true,
-    true,
-    false,
-    true,
-    false,
-    false,
-    |s| format!("{}, ", s),
-  );
+  let for_lifetimes_native =
+    generate_angle_bracket_params(sigs_native, false, false, false, |s| {
+      format!("for<{}> ", s)
+    });
+  let for_lifetimes_native_for_macro =
+    generate_angle_bracket_params(sigs_native, false, false, true, |s| {
+      format!("for<{}> ", s)
+    });
+  let lifetimes_native =
+    generate_angle_bracket_params(sigs_native, false, false, false, |s| s);
+  let for_lifetimes_in_raw =
+    generate_angle_bracket_params(sigs_raw, false, true, false, |s| {
+      format!("for<{}> ", s)
+    });
+  let for_lifetimes_inout_raw =
+    generate_angle_bracket_params(sigs_raw, true, true, false, |s| {
+      format!("for<{}> ", s)
+    });
+  let lifetimes_inout_raw_comma =
+    generate_angle_bracket_params(sigs_raw, true, true, false, |s| {
+      format!("{}, ", s)
+    });
   let call_param_types_native = generate_call_params(
     sigs_native,
     false,
@@ -1624,7 +1741,7 @@ macro_rules! impl_into_{cb_name_lc} {{
   let abi_specific_code = if !use_win64fix {
     format!(
       r#"
-type Raw{cb_name_uc} = {for_lifetimes_raw}extern "C" fn{call_param_types_raw};
+type Raw{cb_name_uc} = {for_lifetimes_in_raw}extern "C" fn{call_param_types_raw};
 
 impl<F> From<F> for {cb_name_uc}
 where
@@ -1633,7 +1750,7 @@ where
 {{
   fn from(_: F) -> Self {{
     #[inline(always)]
-    extern "C" fn adapter<{lifetimes_raw_comma}F: Into{cb_name_uc}>{call_params_full_raw} {{
+    extern "C" fn adapter<{lifetimes_inout_raw_comma}F: Into{cb_name_uc}>{call_params_full_raw} {{
       {raw_to_native_conversions}
     }}
 
@@ -1643,8 +1760,8 @@ where
 "#,
       cb_name_uc = cb_name_uc,
       for_lifetimes_native = for_lifetimes_native,
-      for_lifetimes_raw = for_lifetimes_raw,
-      lifetimes_raw_comma = lifetimes_raw_comma,
+      for_lifetimes_in_raw = for_lifetimes_in_raw,
+      lifetimes_inout_raw_comma = lifetimes_inout_raw_comma,
       call_param_types_native = call_param_types_native,
       call_param_types_raw = call_param_types_raw,
       call_params_full_raw = call_params_full_raw,
@@ -1654,10 +1771,10 @@ where
     format!(
       r#"
 #[cfg(target_family = "unix")]
-type Raw{cb_name_uc} = {for_lifetimes_raw}extern "C" fn{call_param_types_raw};
+type Raw{cb_name_uc} = {for_lifetimes_in_raw}extern "C" fn{call_param_types_raw};
 
 #[cfg(all(target_family = "windows", target_arch = "x86_64"))]
-type Raw{cb_name_uc} = {for_lifetimes_raw}extern "C" fn{call_param_types_raw_win64fix};
+type Raw{cb_name_uc} = {for_lifetimes_inout_raw}extern "C" fn{call_param_types_raw_win64fix};
 
 impl<F> From<F> for {cb_name_uc}
   where
@@ -1666,19 +1783,19 @@ impl<F> From<F> for {cb_name_uc}
 {{
   fn from(_: F) -> Self {{
     #[inline(always)]
-    fn signature_adapter<{lifetimes_raw_comma}F: Into{cb_name_uc}>{call_params_full_raw} {{
+    fn signature_adapter<{lifetimes_inout_raw_comma}F: Into{cb_name_uc}>{call_params_full_raw} {{
       {raw_to_native_conversions}
     }}
 
     #[cfg(target_family = "unix")]
     #[inline(always)]
-    extern "C" fn abi_adapter<{lifetimes_raw_comma}F: Into{cb_name_uc}>{call_params_full_raw} {{
+    extern "C" fn abi_adapter<{lifetimes_inout_raw_comma}F: Into{cb_name_uc}>{call_params_full_raw} {{
       signature_adapter::<F>{call_param_names_raw}
     }}
 
     #[cfg(all(target_family = "windows", target_arch = "x86_64"))]
     #[inline(always)]
-    extern "C" fn abi_adapter<{lifetimes_raw_comma}F: Into{cb_name_uc}>{call_params_full_raw_win64fix} {{
+    extern "C" fn abi_adapter<{lifetimes_inout_raw_comma}F: Into{cb_name_uc}>{call_params_full_raw_win64fix} {{
       unsafe {{
         std::ptr::write(return_value, signature_adapter::<F>{call_param_names_raw});
         return_value
@@ -1691,8 +1808,9 @@ impl<F> From<F> for {cb_name_uc}
 "#,
       cb_name_uc = cb_name_uc,
       for_lifetimes_native = for_lifetimes_native,
-      for_lifetimes_raw = for_lifetimes_raw,
-      lifetimes_raw_comma = lifetimes_raw_comma,
+      for_lifetimes_in_raw = for_lifetimes_in_raw,
+      for_lifetimes_inout_raw = for_lifetimes_inout_raw,
+      lifetimes_inout_raw_comma = lifetimes_inout_raw_comma,
       call_param_types_native = call_param_types_native,
       call_param_types_raw = call_param_types_raw,
       call_param_types_raw_win64fix = call_param_types_raw_win64fix,

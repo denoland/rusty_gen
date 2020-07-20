@@ -4,9 +4,5 @@ version = "0.1.0"
 authors = ["Bert Belder <bertbelder@gmail.com>"]
 edition = "2018"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [dependencies]
 clang = { version = "0.23.0", features = ["clang_8_0"] }
-linked-hash-map = "0.5.3"
-linked_hash_set = "0.1.3"
