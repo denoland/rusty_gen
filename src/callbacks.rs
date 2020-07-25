@@ -162,6 +162,29 @@ fn is_type_used(translation_unit: &TranslationUnit, ty: Type) -> bool {
   })
 }
 
+fn where_is_type_used<'tu>(
+  translation_unit: &'tu TranslationUnit<'tu>,
+  ty: Type<'tu>,
+) -> Vec<Entity<'tu>> {
+  let can_ty = ty.get_canonical_type();
+  let root = translation_unit.get_entity();
+  let mut refs = Vec::<Entity>::new();
+  root.visit_children(|e, _| {
+    if e.get_storage_class().is_some()
+      && e
+        .get_type()
+        .map(|var_ty| var_ty.get_canonical_type() == can_ty)
+        .unwrap_or(false)
+    {
+      refs.push(e);
+      EntityVisitResult::Continue
+    } else {
+      EntityVisitResult::Recurse
+    }
+  });
+  refs
+}
+
 enum TypeParams<'tu> {
   Zero,
   One(Type<'tu>),
@@ -1923,11 +1946,25 @@ fn visit_declaration<'tu>(
     if let Some(ty) = e.get_typedef_underlying_type() {
       if ty.get_kind() == TypeKind::Pointer {
         if let Some(pointee_ty) = ty.get_pointee_type() {
-          if pointee_ty.get_kind() == TypeKind::FunctionPrototype
-            && is_type_used(e.get_translation_unit(), ty)
-          {
-            if let Some(code) = visit_callback_definition(e, pointee_ty) {
-              index.push(code);
+          if pointee_ty.get_kind() == TypeKind::FunctionPrototype {
+            if is_type_used(e.get_translation_unit(), ty) {
+              if let Some(code) = visit_callback_definition(e, pointee_ty) {
+                index.extend(
+                  where_is_type_used(e.get_translation_unit(), ty)
+                    .into_iter()
+                    .map(|e| -> Option<String> {
+                      let vn = e.get_display_name()?;
+                      let pn = e.get_semantic_parent()?.get_display_name()?;
+                      let s = format!("{}::{}", pn, vn);
+                      Some(s)
+                    })
+                    .map(|o| o.unwrap_or_else(|| format!("{:?}", e)))
+                    .map(|n| format!("// @ - {}", n)),
+                );
+                index.push(code);
+              }
+            } else {
+              eprintln!("Not used: `{}`", ty.get_display_name());
             }
           }
         }
