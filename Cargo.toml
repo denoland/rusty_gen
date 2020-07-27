@@ -6,3 +6,4 @@ edition = "2018"
 
 [dependencies]
 clang = { version = "0.23.0", features = ["clang_8_0"] }
+lazy_static = "1.4.0"

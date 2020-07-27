@@ -2,6 +2,7 @@
 
 use clang::*;
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::convert::AsRef;
 use std::fmt::{self, Display, Formatter};
@@ -295,13 +296,16 @@ enum SigType<'tu> {
     signed: bool,
   },
   IntFixedSize {
+    disposition: Disposition,
     bits: u8,
     signed: bool,
   },
   IntPtrSize {
     signed: bool,
   },
-  Double,
+  Float {
+    bits: u8,
+  },
   Isolate {
     disposition: Disposition,
   },
@@ -333,6 +337,14 @@ enum SigType<'tu> {
     info_ty_name: String,
     info_var_name: String,
   },
+  CString {
+    ty_name: String,
+    disposition: Disposition,
+  },
+  String {
+    ty_name: String,
+    disposition: Disposition,
+  },
   Struct {
     ty_name: String,
     disposition: Disposition,
@@ -347,6 +359,27 @@ enum SigType<'tu> {
     needs_cast: bool,
   },
   Unknown(Type<'tu>),
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+struct DisplayMode {
+  pub raw: bool,
+  pub win64_stack_return_fix: bool,
+  pub for_macro: bool,
+}
+
+thread_local! {
+  static DISPLAY_MODE: Cell<DisplayMode> = Default::default();
+}
+
+impl DisplayMode {
+  fn set(new_mode: Self) {
+    DISPLAY_MODE.with(|m| m.set(new_mode));
+  }
+
+  fn get() -> Self {
+    DISPLAY_MODE.with(|m| m.get())
+  }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -429,10 +462,10 @@ impl Disposition {
     }
   }
 
-  pub fn fmt_type(self, ty_name: impl Display, raw: bool) -> String {
+  pub fn fmt_type(self, ty_name: impl Display) -> String {
+    let raw = DisplayMode::get().raw;
     match self {
       Self::Cell if !raw => format!("&'static Cell<{}>", ty_name),
-      _ if raw => format!("{:#}{:#}", self, ty_name),
       _ => format!("{}{}", self, ty_name),
     }
   }
@@ -442,7 +475,7 @@ impl Display for Disposition {
   fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
     match self {
       Self::ConstAuto | Self::MutAuto => {
-        write!(f, "{}", self.as_set_raw(f.alternate()))
+        write!(f, "{}", self.as_set_raw(DisplayMode::get().raw))
       }
       Self::ConstRef => write!(f, "&"),
       Self::MutRef => write!(f, "&mut "),
@@ -462,10 +495,13 @@ impl From<&'static str> for Lifetime {
 
 impl Display for Lifetime {
   fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    let for_macro = DisplayMode::get().for_macro;
     match self {
       Self::Anon => write!(f, "'_"),
-      Self::Named(name) => write!(f, "'{}", name),
+      Self::Named(name) if !for_macro => write!(f, "'{}", name),
+      Self::Named(name) if for_macro => write!(f, "'__{}", name),
       Self::Static => write!(f, "'static"),
+      _ => unreachable!(),
     }
   }
 }
@@ -493,17 +529,14 @@ impl Display for TypeInfo {
     } else {
       format!("{}<{}>", self.name, angle_bracket_params)
     };
-    write!(
-      f,
-      "{}",
-      self.disposition.fmt_type(name_and_params, f.alternate()),
-    )?;
+    write!(f, "{}", self.disposition.fmt_type(name_and_params),)?;
     Ok(())
   }
 }
 
 impl TypeInfo {
-  fn from(sig: &SigType, raw: bool) -> TypeInfo {
+  fn from(sig: &SigType) -> TypeInfo {
+    let DisplayMode { raw, .. } = DisplayMode::get();
     use Disposition as D;
     use SigType as S;
     use TypeInfo as I;
@@ -526,23 +559,15 @@ impl TypeInfo {
       S::Char {
         signed: None,
         disposition,
-      } if raw => I {
+      } => I {
         disposition: disposition.as_raw(),
         name: "c_char".into(),
         ..I::default()
       },
       S::Char {
-        signed: None,
-        disposition,
-      } if !raw => I {
-        disposition: disposition.as_native(),
-        name: "str".into(),
-        ..I::default()
-      },
-      S::Char {
         signed: Some(false),
         disposition,
-      } if raw => I {
+      } => I {
         disposition: disposition.as_raw(),
         name: "c_uchar".into(),
         ..I::default()
@@ -551,44 +576,34 @@ impl TypeInfo {
       S::Int {
         signed: false,
         disposition,
-      } if raw => I {
+      } => I {
         disposition: disposition.as_raw(),
         name: "c_uint".into(),
         ..I::default()
       },
       S::Int {
-        signed: false,
-        disposition,
-      } if !raw => I {
-        disposition: disposition.as_native(),
-        name: "u32".into(),
-        ..I::default()
-      },
-      S::Int {
         signed: true,
         disposition,
-      } if raw => I {
+      } => I {
         disposition: disposition.as_raw(),
         name: "c_int".into(),
         ..I::default()
       },
-      S::Int {
-        signed: true,
-        disposition,
-      } if !raw => I {
-        disposition: disposition.as_native(),
-        name: "i32".into(),
-        ..I::default()
-      },
-      S::Int { .. } => unreachable!(),
       S::IntFixedSize {
+        disposition,
         signed: false,
         bits,
       } => I {
+        disposition: *disposition,
         name: format!("u{}", bits).into(),
         ..I::default()
       },
-      S::IntFixedSize { signed: true, bits } => I {
+      S::IntFixedSize {
+        disposition,
+        signed: true,
+        bits,
+      } => I {
+        disposition: *disposition,
         name: format!("i{}", bits).into(),
         ..I::default()
       },
@@ -600,16 +615,17 @@ impl TypeInfo {
         name: "isize".into(),
         ..I::default()
       },
-      S::Double if raw => I {
+      S::Float { bits: 64 } if raw => I {
         name: "c_double".into(),
         ..I::default()
       },
-      S::Double => I {
-        name: "f64".into(),
+      S::Float { bits } if !raw => I {
+        name: format!("f{}", bits).into(),
         ..I::default()
       },
+      S::Float { .. } => unreachable!(),
       S::Isolate { disposition } => I {
-        disposition: disposition.as_set_raw(raw),
+        disposition: *disposition,
         name: "Isolate".into(),
         ..I::default()
       },
@@ -679,11 +695,23 @@ impl TypeInfo {
         }],
         ..I::default()
       },
+      S::String {
+        disposition,
+        ty_name,
+      }
+      | S::CString {
+        disposition,
+        ty_name,
+      } => I {
+        disposition: *disposition,
+        name: ty_name.clone().into(),
+        ..I::default()
+      },
       S::Struct {
         disposition,
         ty_name,
       } => I {
-        disposition: disposition.as_set_raw(raw),
+        disposition: *disposition,
         name: ty_name.clone().into(),
         ..I::default()
       },
@@ -731,10 +759,10 @@ where
 fn generate_angle_bracket_params<'tu>(
   sigs: &[Sig<'tu>],
   include_return_type: bool,
-  raw: bool,
-  for_macro: bool,
+  mode: DisplayMode,
   wrap_fn: impl Fn(String) -> String,
 ) -> String {
+  DisplayMode::set(mode);
   let type_infos = sigs
     .iter()
     .filter_map(|sig| match sig {
@@ -748,8 +776,8 @@ fn generate_angle_bracket_params<'tu>(
       } if include_return_type => Some(ty),
       _ => None,
     })
-    .map(|ty| TypeInfo::from(ty, raw));
-  let mut lifetimes = collect_named_lifetime_params(type_infos)
+    .map(|ty| TypeInfo::from(ty));
+  let lifetimes = collect_named_lifetime_params(type_infos)
     .into_iter()
     .map(|lt| lt.to_string())
     .collect::<Vec<_>>()
@@ -757,19 +785,13 @@ fn generate_angle_bracket_params<'tu>(
   if lifetimes.is_empty() {
     lifetimes
   } else {
-    if for_macro {
-      lifetimes = lifetimes
-        .replace("'s", "'__s")
-        .replace("'__static", "'static");
-    }
     wrap_fn(lifetimes)
   }
 }
 
 impl<'tu> Display for SigType<'tu> {
   fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-    let raw = f.alternate();
-    write!(f, "{}", TypeInfo::from(self, raw))
+    write!(f, "{}", TypeInfo::from(self))
   }
 }
 
@@ -793,24 +815,25 @@ impl<'tu> Sig<'tu> {
   pub fn generate_call_signature<R>(
     &self,
     rest: R,
-    raw: bool,
-    win64_stack_return_fix: bool,
     with_types: bool,
     with_names: bool,
     closure_style: bool,
     used_inputs: Option<&HashSet<String>>,
   ) -> String
   where
-    R: Iterator<Item = Sig<'tu>>,
+    R: Iterator<Item = Sig<'tu>> + Clone,
   {
+    let DisplayMode {
+      raw,
+      win64_stack_return_fix,
+      ..
+    } = DisplayMode::get();
     let gen_rest = |mut rest: R| {
       let next = rest.next();
       next
         .map(|n| {
           n.generate_call_signature(
             rest,
-            raw,
-            win64_stack_return_fix,
             with_types,
             with_names,
             closure_style,
@@ -837,22 +860,14 @@ impl<'tu> Sig<'tu> {
     };
     let fmt_name = |v| {
       if with_names {
-        if raw {
-          format!("{}{:#}", fmt_name_prefix(v), v)
-        } else {
-          format!("{}{}", fmt_name_prefix(v), v)
-        }
+        format!("{}{}", fmt_name_prefix(v), v)
       } else {
         Default::default()
       }
     };
     let fmt_type = |v| {
       if with_types {
-        if raw {
-          format!("{:#}", v)
-        } else {
-          format!("{}", v)
-        }
+        format!("{}", v)
       } else {
         Default::default()
       }
@@ -888,8 +903,30 @@ impl<'tu> Sig<'tu> {
       Sig { id: I::Return, ty } if ty.is_void() => {
         format!("(\n{}    )\n", gen_rest(rest))
       }
-      Sig { id: I::Return, ty } => {
-        format!("(\n{}    ) -> {}\n", gen_rest(rest), fmt_type(ty))
+      Sig {
+        id: I::Return,
+        ty: ret_ty,
+      } => {
+        let mut rti = TypeInfo::from(ret_ty);
+        if !rti.lifetimes.is_empty() {
+          let param_lifetimes = rest
+            .clone()
+            .into_iter()
+            .map(|sig| TypeInfo::from(&sig.ty))
+            .flat_map(|ti| ti.lifetimes.into_iter())
+            .collect::<HashSet<_>>();
+          rti.lifetimes = rti
+            .lifetimes
+            .into_iter()
+            .map(|lt| match lt {
+              lt @ Lifetime::Named(_) if !param_lifetimes.contains(&lt) => {
+                Lifetime::Static
+              }
+              lt => lt,
+            })
+            .collect();
+        }
+        format!("(\n{}    ) -> {}\n", gen_rest(rest), rti)
       }
       Sig {
         id: I::Param(Some(name)),
@@ -983,13 +1020,14 @@ impl<'tu> Sig<'tu> {
       Sig {
         id: SigIdent::Param(Some(name)),
         ty:
-          SigType::Char {
+          SigType::CString {
             disposition,
-            signed: None,
+            ty_name,
           },
       } if disposition.is_const_address() => format!(
-        "  let {} = unsafe {{ CStr::from_ptr({}) }}.to_str().unwrap();\n{}",
+        "  let {} = unsafe {{ {}::from_ptr({}) }};\n{}",
         name,
+        ty_name,
         name,
         gen_rest(rest)
       ),
@@ -1052,7 +1090,7 @@ impl<'tu> Sig<'tu> {
           _ => unreachable!(),
         };
         let cast = match needs_cast {
-          true => format!(" as {:#} u8", disposition),
+          true => format!(" as {} u8", disposition.as_raw()),
           false => "".to_owned(),
         };
         format!(
@@ -1068,9 +1106,10 @@ impl<'tu> Sig<'tu> {
       Sig {
         id: SigIdent::Return,
         ty:
-          SigType::Int {
+          SigType::IntFixedSize {
             disposition: Disposition::Cell,
             signed,
+            bits: 32,
           },
       } => format!(
         "{}.as_ptr()",
@@ -1089,7 +1128,14 @@ impl<'tu> Sig<'tu> {
       } => {
         let params = once(sig.clone()).chain(rest.clone()).collect::<Vec<_>>();
         let call_params = generate_call_params(
-          &params, false, false, false, true, false, false, None,
+          &params,
+          DisplayMode {
+            ..Default::default()
+          },
+          false,
+          true,
+          false,
+          None,
         );
         format!("{}  (F::get()){}", gen_rest(rest), call_params)
       }
@@ -1161,28 +1207,32 @@ impl<'tu> From<Type<'tu>> for SigType<'tu> {
       M::IntFixedSize {
         bits: 32,
         signed: true,
+        disposition: Disposition::Owned,
       }
     } else if is_std_type(ty, "int64_t") {
       M::IntFixedSize {
         bits: 64,
         signed: true,
+        disposition: Disposition::Owned,
       }
     } else if is_std_type(ty, "uint32_t") {
       M::IntFixedSize {
         bits: 32,
         signed: false,
+        disposition: Disposition::Owned,
       }
     } else if is_std_type(ty, "uint64_t") {
       M::IntFixedSize {
         bits: 64,
         signed: false,
+        disposition: Disposition::Owned,
       }
     } else if is_std_type(ty, "ssize_t") || is_std_type(ty, "intptr_t") {
       M::IntPtrSize { signed: true }
     } else if is_std_type(ty, "size_t") || is_std_type(ty, "uintptr_t") {
       M::IntPtrSize { signed: false }
     } else if ty.get_kind() == K::Double {
-      M::Double
+      M::Float { bits: 64 }
     } else if let Some(TypeParams::One(inner_ty)) =
       is_v8_type(ty, "Local").and_then(get_type_params)
     {
@@ -1296,32 +1346,22 @@ fn gather_recursively_with<
 
 fn generate_call_params<'tu>(
   sigs: &[Sig<'tu>],
-  raw: bool,
-  win64_stack_return_fix: bool,
+  mode: DisplayMode,
   with_types: bool,
   with_names: bool,
   closure_style: bool,
-  for_macro: bool,
   used_inputs: Option<&HashSet<String>>,
 ) -> String {
-  let mut call_params =
-    gather_recursively_with(sigs.to_owned(), |first, rest| {
-      first.generate_call_signature(
-        rest,
-        raw,
-        win64_stack_return_fix,
-        with_types,
-        with_names,
-        closure_style,
-        used_inputs,
-      )
-    });
-  // BLERGH! ugly hack!
-  if for_macro {
-    call_params = call_params
-      .replace("'", "'__")
-      .replace("'__static", "'static");
-  }
+  DisplayMode::set(mode);
+  let call_params = gather_recursively_with(sigs.to_owned(), |first, rest| {
+    first.generate_call_signature(
+      rest,
+      with_types,
+      with_names,
+      closure_style,
+      used_inputs,
+    )
+  });
   call_params
 }
 
@@ -1339,6 +1379,7 @@ fn contains_unknown_cxx_types<'tu>(sigs: &[Sig<'tu>]) -> bool {
 }
 
 fn gather_raw_to_native_conversions<'tu>(sigs: &[Sig<'tu>]) -> String {
+  DisplayMode::set(Default::default());
   gather_recursively_with(sigs.to_owned(), |first, rest| {
     first.gather_raw_to_native_conversions(rest)
   })
@@ -1347,6 +1388,7 @@ fn gather_raw_to_native_conversions<'tu>(sigs: &[Sig<'tu>]) -> String {
 }
 
 fn gather_used_inputs<'tu>(sigs_native: &[Sig<'tu>]) -> HashSet<String> {
+  DisplayMode::set(Default::default());
   gather_recursively_with(sigs_native.to_owned(), |first, rest| {
     let mut used_inputs = HashSet::<String>::new();
     first.gather_raw_to_native_conversion_used_inputs(rest, &mut used_inputs);
@@ -1422,14 +1464,17 @@ fn convert_raw_signature_to_native<'tu>(sigs: &[Sig<'tu>]) -> Vec<Sig<'tu>> {
     // the last resort is to create a CallbackScope<'s, ()> from just the
     // Isolate handle.
     .or_else(|| {
+      DisplayMode::set(DisplayMode {
+        raw: true,
+        ..Default::default()
+      });
       let has_lifetimes = !collect_named_lifetime_params(
-        sigs.iter().map(|sig| TypeInfo::from(&sig.ty, true)),
+        sigs.iter().map(|sig| TypeInfo::from(&sig.ty)),
       )
       .is_empty();
       if !has_lifetimes {
         return None;
       }
-
       // Confirmed that there are lifetimes.
       sigs.iter().find_map(|d| match d {
         Sig {
@@ -1489,6 +1534,17 @@ fn convert_raw_signature_to_native<'tu>(sigs: &[Sig<'tu>]) -> Vec<Sig<'tu>> {
         _ => true,
       } || !has_scope
     )
+    .map(|sig| {
+      let Sig { ty, id } = sig;
+      let ty = match ty {
+        SigType::Int { disposition, signed } =>
+          SigType::IntFixedSize { disposition, signed, bits: 32 },
+        SigType::Char { disposition, signed: None } =>
+          SigType::CString { disposition, ty_name: "CStr".to_owned() },
+        ty => ty
+      };
+      Sig { ty, id }
+      })
     .flat_map(|sig| match sig {
       // Split Function/PropertyCallbackInfo into 'arguments' and, if
       // the return type is not `void`, a 'return_value' object.
@@ -1582,7 +1638,7 @@ fn return_value_requires_win64_stack_return_fix<'tu>(
       } => Some(ty),
       _ => None,
     })
-    .map(|ty| TypeInfo::from(ty, true))
+    .map(|ty| TypeInfo::from(ty))
     .map(|ti| ti.win64_return_value_on_stack)
     .next()
     .unwrap()
@@ -1616,110 +1672,160 @@ fn render_callback_definition<'tu>(
   let cb_comment = cb_comment
     .map(format_comment)
     .unwrap_or_else(|| format!("// === {} ===\n", &cb_name_uc));
-  let for_lifetimes_native =
-    generate_angle_bracket_params(sigs_native, false, false, false, |s| {
-      format!("for<{}> ", s)
-    });
-  let for_lifetimes_native_for_macro =
-    generate_angle_bracket_params(sigs_native, false, false, true, |s| {
-      format!("for<{}> ", s)
-    });
-  let lifetimes_native =
-    generate_angle_bracket_params(sigs_native, false, false, false, |s| s);
-  let for_lifetimes_in_raw =
-    generate_angle_bracket_params(sigs_raw, false, true, false, |s| {
-      format!("for<{}> ", s)
-    });
-  let for_lifetimes_inout_raw =
-    generate_angle_bracket_params(sigs_raw, true, true, false, |s| {
-      format!("for<{}> ", s)
-    });
-  let lifetimes_inout_raw_comma =
-    generate_angle_bracket_params(sigs_raw, true, true, false, |s| {
-      format!("{}, ", s)
-    });
-  let call_param_types_native = generate_call_params(
+  let for_lifetimes_native = generate_angle_bracket_params(
     sigs_native,
     false,
+    DisplayMode::default(),
+    |s| format!("for<{}> ", s),
+  );
+  let for_lifetimes_native_for_macro = generate_angle_bracket_params(
+    sigs_native,
     false,
+    DisplayMode {
+      for_macro: true,
+      ..Default::default()
+    },
+    |s| format!("for<{}> ", s),
+  );
+  let lifetimes_native = generate_angle_bracket_params(
+    sigs_native,
+    false,
+    DisplayMode::default(),
+    |s| s,
+  );
+  let for_lifetimes_in_raw = generate_angle_bracket_params(
+    sigs_raw,
+    false,
+    DisplayMode {
+      raw: true,
+      ..Default::default()
+    },
+    |s| format!("for<{}> ", s),
+  );
+  let for_lifetimes_inout_raw = generate_angle_bracket_params(
+    sigs_raw,
     true,
+    DisplayMode {
+      raw: true,
+      ..Default::default()
+    },
+    |s| format!("for<{}> ", s),
+  );
+  let lifetimes_in_raw_comma = generate_angle_bracket_params(
+    sigs_raw,
     false,
+    DisplayMode {
+      raw: true,
+      ..Default::default()
+    },
+    |s| format!("{}, ", s),
+  );
+  let lifetimes_inout_raw_comma = generate_angle_bracket_params(
+    sigs_raw,
+    true,
+    DisplayMode {
+      raw: true,
+      ..Default::default()
+    },
+    |s| format!("{}, ", s),
+  );
+  let call_param_types_native = generate_call_params(
+    sigs_native,
+    Default::default(),
+    true,
     false,
     false,
     None,
   );
   let call_param_types_native_for_macro = generate_call_params(
     sigs_native,
-    false,
-    false,
+    DisplayMode {
+      for_macro: true,
+      ..Default::default()
+    },
     true,
     false,
     false,
-    true,
     None,
   );
   let call_param_types_raw = generate_call_params(
-    sigs_raw, true, false, true, false, false, false, None,
-  );
-  let call_param_types_raw_win64fix =
-    generate_call_params(sigs_raw, true, true, true, false, false, false, None);
-  let _call_param_names_native = generate_call_params(
-    sigs_native,
-    false,
-    false,
-    false,
+    sigs_raw,
+    DisplayMode {
+      raw: true,
+      ..Default::default()
+    },
     true,
     false,
+    false,
+    None,
+  );
+  let call_param_types_raw_win64fix = generate_call_params(
+    sigs_raw,
+    DisplayMode {
+      raw: true,
+      win64_stack_return_fix: true,
+      ..Default::default()
+    },
+    true,
+    false,
+    false,
+    None,
+  );
+  let _call_param_names_native = generate_call_params(
+    sigs_native,
+    Default::default(),
+    false,
+    true,
     false,
     None,
   );
   let call_param_names_native_closure_notused = generate_call_params(
     sigs_native,
-    false,
-    false,
+    Default::default(),
     false,
     true,
     true,
-    false,
     Some(&Default::default()),
   );
   let call_param_names_raw = generate_call_params(
     sigs_raw,
+    DisplayMode {
+      raw: true,
+      ..Default::default()
+    },
+    false,
     true,
-    false,
-    false,
-    true,
-    false,
     false,
     Some(&used_inputs),
   );
   let call_params_full_native_notused = generate_call_params(
     sigs_native,
-    false,
-    false,
+    Default::default(),
     true,
     true,
-    false,
     false,
     Some(&Default::default()),
   );
   let call_params_full_raw = generate_call_params(
     sigs_raw,
+    DisplayMode {
+      raw: true,
+      ..Default::default()
+    },
     true,
-    false,
     true,
-    true,
-    false,
     false,
     Some(&used_inputs),
   );
   let call_params_full_raw_win64fix = generate_call_params(
     sigs_raw,
+    DisplayMode {
+      raw: true,
+      win64_stack_return_fix: true,
+      ..Default::default()
+    },
     true,
     true,
-    true,
-    true,
-    false,
     false,
     Some(&used_inputs),
   );
@@ -1773,7 +1879,7 @@ where
 {{
   fn from(_: F) -> Self {{
     #[inline(always)]
-    extern "C" fn adapter<{lifetimes_inout_raw_comma}F: Into{cb_name_uc}>{call_params_full_raw} {{
+    extern "C" fn adapter<{lifetimes_in_raw_comma}F: Into{cb_name_uc}>{call_params_full_raw} {{
       {raw_to_native_conversions}
     }}
 
@@ -1784,7 +1890,7 @@ where
       cb_name_uc = cb_name_uc,
       for_lifetimes_native = for_lifetimes_native,
       for_lifetimes_in_raw = for_lifetimes_in_raw,
-      lifetimes_inout_raw_comma = lifetimes_inout_raw_comma,
+      lifetimes_in_raw_comma = lifetimes_in_raw_comma,
       call_param_types_native = call_param_types_native,
       call_param_types_raw = call_param_types_raw,
       call_params_full_raw = call_params_full_raw,
@@ -1806,13 +1912,13 @@ impl<F> From<F> for {cb_name_uc}
 {{
   fn from(_: F) -> Self {{
     #[inline(always)]
-    fn signature_adapter<{lifetimes_inout_raw_comma}F: Into{cb_name_uc}>{call_params_full_raw} {{
+    fn signature_adapter<{lifetimes_in_raw_comma}F: Into{cb_name_uc}>{call_params_full_raw} {{
       {raw_to_native_conversions}
     }}
 
     #[cfg(target_family = "unix")]
     #[inline(always)]
-    extern "C" fn abi_adapter<{lifetimes_inout_raw_comma}F: Into{cb_name_uc}>{call_params_full_raw} {{
+    extern "C" fn abi_adapter<{lifetimes_in_raw_comma}F: Into{cb_name_uc}>{call_params_full_raw} {{
       signature_adapter::<F>{call_param_names_raw}
     }}
 
@@ -1833,6 +1939,7 @@ impl<F> From<F> for {cb_name_uc}
       for_lifetimes_native = for_lifetimes_native,
       for_lifetimes_in_raw = for_lifetimes_in_raw,
       for_lifetimes_inout_raw = for_lifetimes_inout_raw,
+      lifetimes_in_raw_comma = lifetimes_in_raw_comma,
       lifetimes_inout_raw_comma = lifetimes_inout_raw_comma,
       call_param_types_native = call_param_types_native,
       call_param_types_raw = call_param_types_raw,
@@ -1949,18 +2056,18 @@ fn visit_declaration<'tu>(
           if pointee_ty.get_kind() == TypeKind::FunctionPrototype {
             if is_type_used(e.get_translation_unit(), ty) {
               if let Some(code) = visit_callback_definition(e, pointee_ty) {
-                index.extend(
-                  where_is_type_used(e.get_translation_unit(), ty)
-                    .into_iter()
-                    .map(|e| -> Option<String> {
-                      let vn = e.get_display_name()?;
-                      let pn = e.get_semantic_parent()?.get_display_name()?;
-                      let s = format!("{}::{}", pn, vn);
-                      Some(s)
-                    })
-                    .map(|o| o.unwrap_or_else(|| format!("{:?}", e)))
-                    .map(|n| format!("// @ - {}", n)),
-                );
+                //index.extend(
+                //  where_is_type_used(e.get_translation_unit(), ty)
+                //    .into_iter()
+                //    .map(|e| -> Option<String> {
+                //      let vn = e.get_display_name()?;
+                //      let pn = e.get_semantic_parent()?.get_display_name()?;
+                //      let s = format!("{}::{}", pn, vn);
+                //      Some(s)
+                //    })
+                //    .map(|o| o.unwrap_or_else(|| format!("{:?}", e)))
+                //    .map(|n| format!("// @ - {}", n))
+                //);
                 index.push(code);
               }
             } else {
