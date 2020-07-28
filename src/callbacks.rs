@@ -250,20 +250,36 @@ fn get_type_params<'tu>(ty: Type<'tu>) -> Option<TypeParams<'tu>> {
   Some(info)
 }
 
-fn is_std_ns(e: Entity) -> bool {
-  e.get_kind() == EntityKind::Namespace
-    && e.get_name().map(|n| n == "std").unwrap_or(false)
-    && get_named_semantic_parent(e)
-      .map(|p| p.get_kind() == EntityKind::TranslationUnit)
-      .unwrap_or(false)
+fn is_std_or_root_ns(mut e: Entity) -> bool {
+  loop {
+    match e.get_kind() {
+      EntityKind::Namespace => {
+        if e
+          .get_name()
+          .map(|name| ["std", "__1"].contains(&&*name))
+          .to_owned()
+          .unwrap_or(false)
+        {
+          if let Some(ep) = get_named_semantic_parent(e) {
+            e = ep;
+            continue;
+          }
+        }
+      }
+      EntityKind::TranslationUnit => break true,
+      _ => {}
+    }
+    break false;
+  }
 }
 
 fn is_std_type<'tu>(ty: Type<'tu>, name: &str) -> bool {
   ty.get_declaration()
+    .map(|d| d.get_definition().unwrap_or(d))
     .filter(|d| d.get_name().map(|n| n == name).unwrap_or(false))
     .filter(|d| {
       get_named_semantic_parent(*d)
-        .map(|p| is_std_ns(p) || p.get_kind() == EntityKind::TranslationUnit)
+        .map(|p| is_std_or_root_ns(p))
         .unwrap_or(false)
     })
     .is_some()
@@ -338,7 +354,10 @@ enum SigType<'tu> {
     info_var_name: String,
   },
   CString {
-    ty_name: String,
+    disposition: Disposition,
+    source_ty: Box<SigType<'tu>>,
+  },
+  CxxString {
     disposition: Disposition,
   },
   String {
@@ -695,16 +714,29 @@ impl TypeInfo {
         }],
         ..I::default()
       },
-      S::String {
-        disposition,
-        ty_name,
-      }
-      | S::CString {
-        disposition,
-        ty_name,
-      } => I {
+      S::String { disposition, .. } => I {
         disposition: *disposition,
-        name: ty_name.clone().into(),
+        name: if disposition.is_address() {
+          "str"
+        } else {
+          "String"
+        }
+        .into(),
+        ..I::default()
+      },
+      S::CString { disposition, .. } => I {
+        disposition: *disposition,
+        name: if disposition.is_address() {
+          "CStr"
+        } else {
+          "CString"
+        }
+        .into(),
+        ..I::default()
+      },
+      S::CxxString { disposition } => I {
+        disposition: *disposition,
+        name: "CxxString".into(),
         ..I::default()
       },
       S::Struct {
@@ -724,13 +756,10 @@ impl TypeInfo {
         name: "[u8]".into(),
         ..I::default()
       },
-      S::Unknown(ty) => {
-        eprintln!("T?? {}", ty.get_display_name());
-        I {
-          name: format!("T??`{}`", ty.get_display_name()).into(),
-          ..I::default()
-        }
-      }
+      S::Unknown(ty) => I {
+        name: format!("T??`{}`", ty.get_display_name()).into(),
+        ..I::default()
+      },
     }
   }
 }
@@ -1022,15 +1051,23 @@ impl<'tu> Sig<'tu> {
         ty:
           SigType::CString {
             disposition,
-            ty_name,
+            source_ty,
           },
-      } if disposition.is_const_address() => format!(
-        "  let {} = unsafe {{ {}::from_ptr({}) }};\n{}",
-        name,
-        ty_name,
-        name,
-        gen_rest(rest)
-      ),
+      } if disposition.is_const_address() => match &**source_ty {
+        SigType::Char { signed: None, .. } => format!(
+          "  let {} = unsafe {{ CStr::from_ptr({}) }};\n{}",
+          name,
+          name,
+          gen_rest(rest)
+        ),
+        SigType::CxxString { .. } => format!(
+          "  let {} = <&CStr>::from(unsafe {{ &*{} }});\n{}",
+          name,
+          name,
+          gen_rest(rest)
+        ),
+        _ => unreachable!(),
+      },
       Sig {
         id: SigIdent::Param(Some(name)),
         ty: SigType::CallbackScope {
@@ -1182,6 +1219,14 @@ impl<'tu> From<Type<'tu>> for SigType<'tu> {
       M::Char {
         disposition: Disposition::auto(pty),
         signed: None,
+      }
+    } else if let Some(pty) = ty
+      .get_pointee_type()
+      // .and_then(|pty| pty.get_modified_type())
+      .filter(|&pty| is_std_type(pty, "string"))
+    {
+      M::CxxString {
+        disposition: Disposition::auto(pty),
       }
     } else if let Some(pty) = ty
       .get_pointee_type()
@@ -1365,17 +1410,22 @@ fn generate_call_params<'tu>(
   call_params
 }
 
-fn contains_unknown_cxx_types<'tu>(sigs: &[Sig<'tu>]) -> bool {
-  sigs
+fn contains_unknown_cxx_types<'tu>(sigs: &[Sig<'tu>]) -> Option<Vec<String>> {
+  let unk = sigs
     .iter()
-    .find(|sig| match sig {
+    .filter_map(|sig| match sig {
       Sig {
-        ty: SigType::Unknown(_),
+        ty: SigType::Unknown(ty),
         ..
-      } => true,
-      _ => false,
+      } => Some(ty.get_display_name()),
+      _ => None,
     })
-    .is_some()
+    .collect::<Vec<_>>();
+  if unk.is_empty() {
+    None
+  } else {
+    Some(unk)
+  }
 }
 
 fn gather_raw_to_native_conversions<'tu>(sigs: &[Sig<'tu>]) -> String {
@@ -1540,7 +1590,9 @@ fn convert_raw_signature_to_native<'tu>(sigs: &[Sig<'tu>]) -> Vec<Sig<'tu>> {
         SigType::Int { disposition, signed } =>
           SigType::IntFixedSize { disposition, signed, bits: 32 },
         SigType::Char { disposition, signed: None } =>
-          SigType::CString { disposition, ty_name: "CStr".to_owned() },
+          SigType::CString { disposition, source_ty: Box::new(ty) },
+        SigType::CxxString { disposition } =>
+          SigType::CString { disposition, source_ty: Box::new(ty) },
         ty => ty
       };
       Sig { ty, id }
@@ -2009,19 +2061,30 @@ fn comment_out(code: String) -> String {
     .collect::<String>()
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CallbackTranslationError {
+  GetResultTypeFailed,
+  GetArgumentTypesFailed,
+  UnknownType(Vec<String>),
+}
+
 fn visit_callback_definition<'tu>(
   e: Entity<'tu>,   // The typedef definition node.
   fn_ty: Type<'tu>, // The callback function prototype.
-) -> Option<String> {
+) -> Result<String, CallbackTranslationError> {
   let cb_name = get_flat_name_for_callback_type(e);
   let cb_comment = e.get_comment();
-  let ret_ty = fn_ty.get_result_type()?;
+  let ret_ty = fn_ty
+    .get_result_type()
+    .ok_or(CallbackTranslationError::GetResultTypeFailed)?;
   let arg_names = e
     .get_children()
     .into_iter()
     .filter(|c| c.get_kind() == EntityKind::ParmDecl)
     .map(|c| c.get_name());
-  let arg_tys = fn_ty.get_argument_types()?;
+  let arg_tys = fn_ty
+    .get_argument_types()
+    .ok_or(CallbackTranslationError::GetArgumentTypesFailed)?;
   let sigs_raw = once(Sig::new_return(ret_ty))
     .chain(arg_names.zip(arg_tys).map(Sig::from))
     .collect();
@@ -2037,11 +2100,10 @@ fn visit_callback_definition<'tu>(
     used_inputs,
     use_win64fix,
   );
-  if contains_unknown_cxx_types(&sigs_raw) {
-    // Some(comment_out(code))
-    None
+  if let Some(unk_ty_names) = contains_unknown_cxx_types(&sigs_raw) {
+    Err(CallbackTranslationError::UnknownType(unk_ty_names))
   } else {
-    Some(code)
+    Ok(code)
   }
 }
 
@@ -2055,7 +2117,7 @@ fn visit_declaration<'tu>(
         if let Some(pointee_ty) = ty.get_pointee_type() {
           if pointee_ty.get_kind() == TypeKind::FunctionPrototype {
             if is_type_used(e.get_translation_unit(), ty) {
-              if let Some(code) = visit_callback_definition(e, pointee_ty) {
+              match visit_callback_definition(e, pointee_ty) {
                 //index.extend(
                 //  where_is_type_used(e.get_translation_unit(), ty)
                 //    .into_iter()
@@ -2068,7 +2130,10 @@ fn visit_declaration<'tu>(
                 //    .map(|o| o.unwrap_or_else(|| format!("{:?}", e)))
                 //    .map(|n| format!("// @ - {}", n))
                 //);
-                index.push(code);
+                Ok(code) => index.push(code),
+                Err(e) => {
+                  eprintln!("Skipped: `{}`: {:?}", ty.get_display_name(), e)
+                }
               }
             } else {
               eprintln!("Not used: `{}`", ty.get_display_name());
@@ -2273,6 +2338,18 @@ use crate::Value;
 #[repr(C)] pub enum  GCType { _TODO }
 #[repr(C)] pub enum  PromiseHookType { _TODO }
 #[repr(C)] pub enum  UseCounterFeature { _TODO }
+
+/// Rust representation of a C++ `std::string`.
+#[repr(C)]
+pub struct CxxString(Opaque);
+
+impl<'a> From<&'a CxxString> for &'a [u8] {
+  fn from(_cxx_str: &'a CxxString) -> Self { unimplemented!() }
+}
+
+impl<'a> From<&'a CxxString> for &'a CStr {
+  fn from(_cxx_str: &'a CxxString) -> Self { unimplemented!() }
+}
 
 // Notes:
 // * This enum should really be #[repr(bool)] but Rust doesn't support that.
