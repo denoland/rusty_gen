@@ -482,8 +482,11 @@ impl Disposition {
   }
 
   pub fn fmt_type(self, ty_name: impl Display) -> String {
-    let raw = DisplayMode::get().raw;
+    let DisplayMode { raw, for_macro, .. } = DisplayMode::get();
     match self {
+      Self::Cell if !raw && for_macro => {
+        format!("&'static ::std::cell::Cell<{}>", ty_name)
+      }
       Self::Cell if !raw => format!("&'static Cell<{}>", ty_name),
       _ => format!("{}{}", self, ty_name),
     }
@@ -525,10 +528,46 @@ impl Display for Lifetime {
   }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+enum Origin {
+  Undefined,
+  Builtin,
+  Crate,
+  CratePrivate(&'static str),
+  CrateSupport,
+  Std(&'static str),
+  StdFfi,
+  StdRaw,
+}
+
+impl Default for Origin {
+  fn default() -> Self {
+    Origin::Undefined
+  }
+}
+
+impl Display for Origin {
+  fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    match self {
+      Self::Undefined => write!(f, "<??>::"),
+      Self::Builtin => Ok(()),
+      Self::Crate => write!(f, "$crate::"),
+      Self::CratePrivate(submod) => write!(f, "$crate::{}::", submod),
+      Self::CrateSupport => write!(f, "$crate::util::"),
+      Self::Std(submod) if submod.is_empty() => write!(f, "::std::"),
+      Self::Std(submod) => write!(f, "::std::{}::", submod),
+      Self::StdFfi => write!(f, "::std::ffi::"),
+      Self::StdRaw => write!(f, "::std::os::raw::"),
+    }
+  }
+}
+
 #[derive(Default)]
 struct TypeInfo {
   pub disposition: Disposition,
+  pub origin: Origin,
   pub name: Cow<'static, str>,
+  pub slice: bool,
   pub lifetimes: Vec<Lifetime>,
   pub type_args: Vec<TypeInfo>,
   pub win64_return_value_on_stack: bool,
@@ -548,7 +587,17 @@ impl Display for TypeInfo {
     } else {
       format!("{}<{}>", self.name, angle_bracket_params)
     };
-    write!(f, "{}", self.disposition.fmt_type(name_and_params),)?;
+    let path_and_params = if DisplayMode::get().for_macro {
+      format!("{}{}", self.origin, name_and_params)
+    } else {
+      name_and_params
+    };
+    let type_and_params = if self.slice {
+      format!("[{}]", path_and_params)
+    } else {
+      path_and_params
+    };
+    write!(f, "{}", self.disposition.fmt_type(type_and_params),)?;
     Ok(())
   }
 }
@@ -564,15 +613,18 @@ impl TypeInfo {
         disposition: D::Owned,
       } => I {
         name: "()".into(),
+        origin: Origin::Builtin,
         ..I::default()
       },
       S::Void { disposition } => I {
         disposition: disposition.as_raw(),
         name: "c_void".into(),
+        origin: Origin::StdFfi,
         ..I::default()
       },
       S::Bool => I {
         name: "bool".into(),
+        origin: Origin::Builtin,
         ..I::default()
       },
       S::Char {
@@ -581,6 +633,7 @@ impl TypeInfo {
       } => I {
         disposition: disposition.as_raw(),
         name: "c_char".into(),
+        origin: Origin::StdRaw,
         ..I::default()
       },
       S::Char {
@@ -589,6 +642,7 @@ impl TypeInfo {
       } => I {
         disposition: disposition.as_raw(),
         name: "c_uchar".into(),
+        origin: Origin::StdRaw,
         ..I::default()
       },
       S::Char { .. } => unreachable!(),
@@ -598,6 +652,7 @@ impl TypeInfo {
       } => I {
         disposition: disposition.as_raw(),
         name: "c_uint".into(),
+        origin: Origin::StdRaw,
         ..I::default()
       },
       S::Int {
@@ -606,6 +661,7 @@ impl TypeInfo {
       } => I {
         disposition: disposition.as_raw(),
         name: "c_int".into(),
+        origin: Origin::StdRaw,
         ..I::default()
       },
       S::IntFixedSize {
@@ -615,6 +671,7 @@ impl TypeInfo {
       } => I {
         disposition: *disposition,
         name: format!("u{}", bits).into(),
+        origin: Origin::Builtin,
         ..I::default()
       },
       S::IntFixedSize {
@@ -624,10 +681,12 @@ impl TypeInfo {
       } => I {
         disposition: *disposition,
         name: format!("i{}", bits).into(),
+        origin: Origin::Builtin,
         ..I::default()
       },
       S::IntPtrSize { signed: false } => I {
         name: "usize".into(),
+        origin: Origin::Builtin,
         ..I::default()
       },
       S::IntPtrSize { signed: true } => I {
@@ -636,24 +695,29 @@ impl TypeInfo {
       },
       S::Float { bits: 64 } if raw => I {
         name: "c_double".into(),
+        origin: Origin::StdRaw,
         ..I::default()
       },
       S::Float { bits } if !raw => I {
         name: format!("f{}", bits).into(),
+        origin: Origin::Builtin,
         ..I::default()
       },
       S::Float { .. } => unreachable!(),
       S::Isolate { disposition } => I {
         disposition: *disposition,
         name: "Isolate".into(),
+        origin: Origin::Crate,
         ..I::default()
       },
       S::CallbackScope { with_context, .. } => I {
         disposition: D::MutRef,
         name: "HandleScope".into(),
+        origin: Origin::CratePrivate("scope"),
         lifetimes: vec!["s".into()],
         type_args: once(I {
           name: "()".into(),
+          origin: Origin::Builtin,
           ..I::default()
         })
         .filter(|_| !with_context)
@@ -662,9 +726,11 @@ impl TypeInfo {
       },
       S::Local { inner_ty_name, .. } => I {
         name: "Local".into(),
+        origin: Origin::Crate,
         lifetimes: vec!["s".into()],
         type_args: vec![I {
           name: inner_ty_name.clone().into(),
+          origin: Origin::Crate,
           ..I::default()
         }],
         win64_return_value_on_stack: true,
@@ -672,11 +738,14 @@ impl TypeInfo {
       },
       S::MaybeLocal { inner_ty_name, .. } => I {
         name: "Option".into(),
+        origin: Origin::Std("option"),
         type_args: vec![I {
           name: "Local".into(),
+          origin: Origin::Crate,
           lifetimes: vec!["s".into()],
           type_args: vec![I {
             name: inner_ty_name.clone().into(),
+            origin: Origin::Crate,
             ..I::default()
           }],
           ..I::default()
@@ -686,30 +755,36 @@ impl TypeInfo {
       },
       S::ModifyCodeGenerationFromStringsResult => I {
         name: "ModifyCodeGenerationFromStringsResult".into(),
+        origin: Origin::Crate,
         lifetimes: vec!["s".into()],
         win64_return_value_on_stack: true,
         ..I::default()
       },
       S::PromiseRejectMessage => I {
         name: "PromiseRejectMessage".into(),
+        origin: Origin::Crate,
         lifetimes: vec!["s".into()],
         ..I::default()
       },
       S::CallbackInfo { ty_name, .. } => I {
         disposition: D::ConstPtr,
+        origin: Origin::Crate,
         name: ty_name.clone().into(),
         ..I::default()
       },
       S::CallbackArguments { ty_name, .. } => I {
         name: ty_name.clone().into(),
+        origin: Origin::Crate,
         lifetimes: vec!["s".into()],
         ..I::default()
       },
       S::CallbackReturnValue { ret_ty_name, .. } => I {
         name: "ReturnValue".into(),
+        origin: Origin::Crate,
         lifetimes: vec!["s".into()],
         type_args: vec![I {
           name: ret_ty_name.clone().into(),
+          origin: Origin::Crate,
           ..I::default()
         }],
         ..I::default()
@@ -722,6 +797,7 @@ impl TypeInfo {
           "String"
         }
         .into(),
+        origin: Origin::Std("string"),
         ..I::default()
       },
       S::CString { disposition, .. } => I {
@@ -732,11 +808,13 @@ impl TypeInfo {
           "CString"
         }
         .into(),
+        origin: Origin::StdFfi,
         ..I::default()
       },
       S::CxxString { disposition } => I {
         disposition: *disposition,
         name: "CxxString".into(),
+        origin: Origin::Crate, // Todo: move to mod `support`.
         ..I::default()
       },
       S::Struct {
@@ -745,19 +823,23 @@ impl TypeInfo {
       } => I {
         disposition: *disposition,
         name: ty_name.clone().into(),
+        origin: Origin::Crate,
         ..I::default()
       },
       S::Enum { ty_name } => I {
         name: ty_name.clone().into(),
+        origin: Origin::Crate,
         ..I::default()
       },
       S::ByteSlice { disposition, .. } => I {
         disposition: disposition.as_native(),
-        name: "[u8]".into(),
+        name: "u8".into(),
+        origin: Origin::Builtin,
+        slice: true,
         ..I::default()
       },
       S::Unknown(ty) => I {
-        name: format!("T??`{}`", ty.get_display_name()).into(),
+        name: format!("«{}»", ty.get_display_name()).into(),
         ..I::default()
       },
     }
@@ -1906,8 +1988,8 @@ impl<F> Into{cb_name_uc} for F where
 macro_rules! impl_into_{cb_name_lc} {{
   () => {{
     impl $crate::support::UnitType
-    + Into<{cb_name_uc}>
-    + {for_lifetimes_native_for_macro}FnOnce{call_param_types_native_for_macro}  }};
+    + ::std::convert::Into<$crate::{cb_name_uc}>
+    + {for_lifetimes_native_for_macro}::std::ops::FnOnce{call_param_types_native_for_macro}  }};
 }}
 "#,
     cb_name_uc = cb_name_uc,
