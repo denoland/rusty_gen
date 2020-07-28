@@ -11,6 +11,8 @@ use std::io;
 use std::io::Write;
 use std::iter::once;
 use std::iter::IntoIterator;
+use std::mem::replace;
+use std::mem::take;
 use std::process::Command;
 use std::process::Output;
 use std::process::Stdio;
@@ -113,16 +115,22 @@ fn to_snake_case(s: impl AsRef<str>) -> String {
   let mut words = vec![];
   for part in s.as_ref().split('_') {
     let mut last_upper = false;
+    let mut upper_streak = true;
     let mut buf = String::new();
     if part.is_empty() {
       continue;
     }
     for ch in part.chars() {
       if !buf.is_empty() && buf != "'" && ch.is_uppercase() && !last_upper {
-        words.push(buf);
-        buf = String::new();
+        words.push(take(&mut buf));
+        upper_streak = true;
+      } else if upper_streak && !ch.is_uppercase() && buf.len() > 1 {
+        let next_buf = buf.pop().into_iter().collect::<String>();
+        words.push(replace(&mut buf, next_buf));
+        upper_streak = true;
       }
       last_upper = ch.is_uppercase();
+      upper_streak &= last_upper;
       buf.extend(ch.to_lowercase());
     }
     words.push(buf);
@@ -1644,7 +1652,7 @@ fn convert_raw_signature_to_native<'tu>(sigs: &[Sig<'tu>]) -> Vec<Sig<'tu>> {
     })
     .flat_map(move |sig| match sig {
       // Keep the return type at the beginning of the list.
-      // Insert the CallbackScopeCallbackScope (if any) right after the return type.
+      // Insert the scope (if any) right after the return type.
       Sig {
         id: SigIdent::Return,
         ..
@@ -1757,6 +1765,23 @@ fn convert_raw_signature_to_native<'tu>(sigs: &[Sig<'tu>]) -> Vec<Sig<'tu>> {
         }
       }
     }})
+    // Move any `void* data` user data field to the end of the parameter list,
+    // unless it is "histogram".
+    .map(|sig| Some(sig))
+    .chain(once(None))
+    .scan(None, |hold, sig| {
+      Some(match sig {
+        Some(Sig {
+          ty: SigType::Void { disposition,.. }, id: SigIdent::Param(ref param_name)
+        }) if disposition.is_mut_address() && param_name != &Some("histogram".to_owned()) => {
+          assert!(hold.is_none());
+          replace(hold, sig)
+        },
+        Some(_) => sig,
+        None => replace(hold, None)
+      })
+    })
+    .filter_map(|opt_sig: Option<Sig>| opt_sig)
     .collect::<Vec<_>>()
 }
 

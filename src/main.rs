@@ -1,4 +1,4 @@
-mod callbacks;
+mod callback;
 mod data;
 
 use std::path::Path;
@@ -41,7 +41,7 @@ fn main() {
     exit(1);
   }
 
-  callbacks::generate(&tu);
+  callback::generate(&tu);
 
   if false {
     #[allow(unreachable_code)]
