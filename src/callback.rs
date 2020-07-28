@@ -393,6 +393,7 @@ struct DisplayMode {
   pub raw: bool,
   pub win64_stack_return_fix: bool,
   pub for_macro: bool,
+  pub with_fn_body: bool,
 }
 
 thread_local! {
@@ -945,6 +946,7 @@ impl<'tu> Sig<'tu> {
     let DisplayMode {
       raw,
       win64_stack_return_fix,
+      with_fn_body,
       ..
     } = DisplayMode::get();
     let gen_rest = |mut rest: R| {
@@ -991,37 +993,42 @@ impl<'tu> Sig<'tu> {
         Default::default()
       }
     };
+    let fmt_body = |b: &str| {
+      if with_fn_body {
+        format!(" {}", b)
+      } else {
+        Default::default()
+      }
+    };
     use SigIdent as I;
     match self {
       Sig { id: I::Return, .. } if !with_types && !closure_style => {
         format!("({})", gen_rest(rest))
       }
       Sig { id: I::Return, .. } if !with_types && closure_style => {
-        format!("|{}|", gen_rest(rest))
+        format!("|{}|{}", gen_rest(rest), fmt_body("todo!()"))
       }
       Sig { id: I::Return, ty }
         if raw && !with_names && win64_stack_return_fix =>
       {
-        format!(
-          "(\n  *mut {:#},\n{}) -> *mut {:#}\n",
-          ty,
-          gen_rest(rest),
-          ty
-        )
+        format!("(\n  *mut {},\n{}) -> *mut {}\n", ty, gen_rest(rest), ty)
       }
       Sig { id: I::Return, ty }
         if raw && with_names && win64_stack_return_fix =>
       {
         format!(
-          "(\n  return_value: *mut {:#},\n{}) -> *mut {:#}\n",
+          "(\n  return_value: *mut {},\n{}) -> *mut {}{}\n",
           ty,
           gen_rest(rest),
-          ty
+          ty,
+          fmt_body(" {\n  todo!()\n}")
         )
       }
-      Sig { id: I::Return, ty } if ty.is_void() => {
-        format!("(\n{}    )\n", gen_rest(rest))
-      }
+      Sig { id: I::Return, ty } if ty.is_void() => format!(
+        "(\n{}    ){}\n",
+        gen_rest(rest),
+        fmt_body(" {\n  todo!();\n}")
+      ),
       Sig {
         id: I::Return,
         ty: ret_ty,
@@ -1045,7 +1052,12 @@ impl<'tu> Sig<'tu> {
             })
             .collect();
         }
-        format!("(\n{}    ) -> {}\n", gen_rest(rest), rti)
+        format!(
+          "(\n{}    ) -> {}{}\n",
+          gen_rest(rest),
+          rti,
+          fmt_body(" {\n  todo!()\n}")
+        )
       }
       Sig {
         id: I::Param(Some(name)),
@@ -1312,7 +1324,6 @@ impl<'tu> From<Type<'tu>> for SigType<'tu> {
       }
     } else if let Some(pty) = ty
       .get_pointee_type()
-      // .and_then(|pty| pty.get_modified_type())
       .filter(|&pty| is_std_type(pty, "string"))
     {
       M::CxxString {
@@ -1957,6 +1968,17 @@ fn render_callback_definition<'tu>(
     false,
     Some(&used_inputs),
   );
+  let call_params_full_native_example = generate_call_params(
+    sigs_native,
+    DisplayMode {
+      with_fn_body: true,
+      ..Default::default()
+    },
+    true,
+    true,
+    false,
+    None,
+  );
   let call_params_full_native_notused = generate_call_params(
     sigs_native,
     Default::default(),
@@ -1990,9 +2012,30 @@ fn render_callback_definition<'tu>(
   );
   let raw_to_native_conversions = gather_raw_to_native_conversions(sigs_native);
 
+  let example_code_comment = Some(())
+    .into_iter()
+    .filter(|_| !cb_comment.trim().is_empty())
+    .map(|_| "///\n".to_owned())
+    .chain(once("/// ```\n".to_owned()))
+    .chain(
+      rustfmt(
+        &format!(
+          "fn example_{cb_name_lc}{call_params_full_native_example}",
+          cb_name_lc = cb_name_lc,
+          call_params_full_native_example = call_params_full_native_example
+        ),
+        Some(76),
+      )
+      .lines()
+      .map(|l| format!("/// {}\n", l)),
+    )
+    .chain(once("/// ```".to_owned()))
+    .collect::<String>();
+
   let common_code = format!(
     r#"
 {cb_comment}
+{example_code_comment}
 #[derive(Copy, Clone)]
 #[repr(transparent)]
 pub struct {cb_name_uc}(Raw{cb_name_uc});
@@ -2020,6 +2063,7 @@ macro_rules! impl_into_{cb_name_lc} {{
     cb_name_uc = cb_name_uc,
     cb_name_lc = cb_name_lc,
     cb_comment = cb_comment,
+    example_code_comment = example_code_comment,
     for_lifetimes_native = for_lifetimes_native,
     for_lifetimes_native_for_macro = for_lifetimes_native_for_macro,
     call_param_types_native = call_param_types_native,
@@ -2199,18 +2243,17 @@ fn visit_callback_definition<'tu>(
   let sigs_native = convert_raw_signature_to_native(&sigs_raw);
   let used_inputs = gather_used_inputs(&sigs_native);
   let use_win64fix = return_value_requires_win64_stack_return_fix(&sigs_raw);
-  let code = render_callback_definition(
-    &cb_name,
-    cb_comment.as_deref(),
-    &sigs_native,
-    &sigs_raw,
-    used_inputs,
-    use_win64fix,
-  );
   if let Some(unk_ty_names) = contains_unknown_cxx_types(&sigs_raw) {
     Err(CallbackTranslationError::UnknownType(unk_ty_names))
   } else {
-    Ok(code)
+    Ok(render_callback_definition(
+      &cb_name,
+      cb_comment.as_deref(),
+      &sigs_native,
+      &sigs_raw,
+      used_inputs,
+      use_win64fix,
+    ))
   }
 }
 
@@ -2284,22 +2327,26 @@ fn visit_translation_unit<'tu>(
 
 pub fn generate(tu: &TranslationUnit) {
   let code = format!("{}\n{}", boilerplate(), visit_translation_unit(tu));
-  let code = rustfmt(&code);
+  let code = rustfmt(&code, None);
   print!("{}", code);
 }
 
-fn rustfmt(code: &str) -> String {
-  run_rustfmt(code, true)
-    .or_else(|_| run_rustfmt(code, false))
+fn rustfmt(code: &str, max_width: Option<u32>) -> String {
+  run_rustfmt(code, max_width, true)
+    .or_else(|_| run_rustfmt(code, max_width, false))
     .unwrap()
 }
 
-fn run_rustfmt(code: &str, nightly: bool) -> io::Result<String> {
+fn run_rustfmt(
+  code: &str,
+  max_width: Option<u32>,
+  nightly: bool,
+) -> io::Result<String> {
   let mut c = Command::new("rustfmt");
   c.stdin(Stdio::piped())
     .stdout(Stdio::piped())
     .arg("--edition=2018")
-    .arg(rustfmt_config("max_width", 80))
+    .arg(rustfmt_config("max_width", max_width.unwrap_or(80)))
     .arg(rustfmt_config("tab_spaces", 2));
   if nightly {
     c.arg("--unstable-features")
