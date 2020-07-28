@@ -1839,7 +1839,7 @@ fn render_callback_definition<'tu>(
 ) -> String {
   let cb_name_uc = cb_name;
   let cb_name_lc = to_snake_case(&cb_name);
-  let cb_comment = cb_comment
+  let cb_comment_or_separator = cb_comment
     .map(format_comment)
     .unwrap_or_else(|| format!("// === {} ===\n", &cb_name_uc));
   let for_lifetimes_native = generate_angle_bracket_params(
@@ -1861,7 +1861,7 @@ fn render_callback_definition<'tu>(
     sigs_native,
     false,
     DisplayMode::default(),
-    |s| s,
+    |s| format!("<{}>", s),
   );
   let for_lifetimes_in_raw = generate_angle_bracket_params(
     sigs_raw,
@@ -2012,16 +2012,15 @@ fn render_callback_definition<'tu>(
   );
   let raw_to_native_conversions = gather_raw_to_native_conversions(sigs_native);
 
-  let example_code_comment = Some(())
-    .into_iter()
-    .filter(|_| !cb_comment.trim().is_empty())
+  let example_code_comment = cb_comment.iter()
     .map(|_| "///\n".to_owned())
-    .chain(once("/// ```\n".to_owned()))
+    .chain(once("/// ## Example\n///\n/// ```ignore\n".to_owned()))
     .chain(
       rustfmt(
         &format!(
-          "fn example_{cb_name_lc}{call_params_full_native_example}",
+          "fn {cb_name_lc}_example{lifetimes_native}{call_params_full_native_example}",
           cb_name_lc = cb_name_lc,
+          lifetimes_native = lifetimes_native,
           call_params_full_native_example = call_params_full_native_example
         ),
         Some(76),
@@ -2034,7 +2033,7 @@ fn render_callback_definition<'tu>(
 
   let common_code = format!(
     r#"
-{cb_comment}
+{cb_comment_or_separator}
 {example_code_comment}
 #[derive(Copy, Clone)]
 #[repr(transparent)]
@@ -2062,7 +2061,7 @@ macro_rules! impl_into_{cb_name_lc} {{
 "#,
     cb_name_uc = cb_name_uc,
     cb_name_lc = cb_name_lc,
-    cb_comment = cb_comment,
+    cb_comment_or_separator = cb_comment_or_separator,
     example_code_comment = example_code_comment,
     for_lifetimes_native = for_lifetimes_native,
     for_lifetimes_native_for_macro = for_lifetimes_native_for_macro,
@@ -2157,7 +2156,7 @@ impl<F> From<F> for {cb_name_uc}
   let test_code = format!(
     r#"
 #[cfg(test)]
-fn mock_{cb_name_lc}<{lifetimes_native}>{call_params_full_native_notused} {{
+fn mock_{cb_name_lc}{lifetimes_native}{call_params_full_native_notused} {{
   unimplemented!()
 }}
 
