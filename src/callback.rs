@@ -538,7 +538,7 @@ impl Display for Lifetime {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
-enum Origin {
+enum ModPath {
   Undefined,
   Builtin,
   Crate,
@@ -549,13 +549,13 @@ enum Origin {
   StdRaw,
 }
 
-impl Default for Origin {
+impl Default for ModPath {
   fn default() -> Self {
-    Origin::Undefined
+    ModPath::Undefined
   }
 }
 
-impl Display for Origin {
+impl Display for ModPath {
   fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
     match self {
       Self::Undefined => write!(f, "<??>::"),
@@ -574,7 +574,7 @@ impl Display for Origin {
 #[derive(Default)]
 struct TypeInfo {
   pub disposition: Disposition,
-  pub origin: Origin,
+  pub mod_path: ModPath,
   pub name: Cow<'static, str>,
   pub slice: bool,
   pub lifetimes: Vec<Lifetime>,
@@ -597,7 +597,7 @@ impl Display for TypeInfo {
       format!("{}<{}>", self.name, angle_bracket_params)
     };
     let path_and_params = if DisplayMode::get().for_macro {
-      format!("{}{}", self.origin, name_and_params)
+      format!("{}{}", self.mod_path, name_and_params)
     } else {
       name_and_params
     };
@@ -622,18 +622,18 @@ impl TypeInfo {
         disposition: D::Owned,
       } => I {
         name: "()".into(),
-        origin: Origin::Builtin,
+        mod_path: ModPath::Builtin,
         ..I::default()
       },
       S::Void { disposition } => I {
         disposition: disposition.as_raw(),
         name: "c_void".into(),
-        origin: Origin::StdFfi,
+        mod_path: ModPath::StdFfi,
         ..I::default()
       },
       S::Bool => I {
         name: "bool".into(),
-        origin: Origin::Builtin,
+        mod_path: ModPath::Builtin,
         ..I::default()
       },
       S::Char {
@@ -642,7 +642,7 @@ impl TypeInfo {
       } => I {
         disposition: disposition.as_raw(),
         name: "c_char".into(),
-        origin: Origin::StdRaw,
+        mod_path: ModPath::StdRaw,
         ..I::default()
       },
       S::Char {
@@ -651,7 +651,7 @@ impl TypeInfo {
       } => I {
         disposition: disposition.as_raw(),
         name: "c_uchar".into(),
-        origin: Origin::StdRaw,
+        mod_path: ModPath::StdRaw,
         ..I::default()
       },
       S::Char { .. } => unreachable!(),
@@ -661,7 +661,7 @@ impl TypeInfo {
       } => I {
         disposition: disposition.as_raw(),
         name: "c_uint".into(),
-        origin: Origin::StdRaw,
+        mod_path: ModPath::StdRaw,
         ..I::default()
       },
       S::Int {
@@ -670,7 +670,7 @@ impl TypeInfo {
       } => I {
         disposition: disposition.as_raw(),
         name: "c_int".into(),
-        origin: Origin::StdRaw,
+        mod_path: ModPath::StdRaw,
         ..I::default()
       },
       S::IntFixedSize {
@@ -680,7 +680,7 @@ impl TypeInfo {
       } => I {
         disposition: *disposition,
         name: format!("u{}", bits).into(),
-        origin: Origin::Builtin,
+        mod_path: ModPath::Builtin,
         ..I::default()
       },
       S::IntFixedSize {
@@ -690,12 +690,12 @@ impl TypeInfo {
       } => I {
         disposition: *disposition,
         name: format!("i{}", bits).into(),
-        origin: Origin::Builtin,
+        mod_path: ModPath::Builtin,
         ..I::default()
       },
       S::IntPtrSize { signed: false } => I {
         name: "usize".into(),
-        origin: Origin::Builtin,
+        mod_path: ModPath::Builtin,
         ..I::default()
       },
       S::IntPtrSize { signed: true } => I {
@@ -704,29 +704,29 @@ impl TypeInfo {
       },
       S::Float { bits: 64 } if raw => I {
         name: "c_double".into(),
-        origin: Origin::StdRaw,
+        mod_path: ModPath::StdRaw,
         ..I::default()
       },
       S::Float { bits } if !raw => I {
         name: format!("f{}", bits).into(),
-        origin: Origin::Builtin,
+        mod_path: ModPath::Builtin,
         ..I::default()
       },
       S::Float { .. } => unreachable!(),
       S::Isolate { disposition } => I {
         disposition: *disposition,
         name: "Isolate".into(),
-        origin: Origin::Crate,
+        mod_path: ModPath::Crate,
         ..I::default()
       },
       S::CallbackScope { with_context, .. } => I {
         disposition: D::MutRef,
         name: "HandleScope".into(),
-        origin: Origin::CratePrivate("scope"),
+        mod_path: ModPath::CratePrivate("scope"),
         lifetimes: vec!["s".into()],
         type_args: once(I {
           name: "()".into(),
-          origin: Origin::Builtin,
+          mod_path: ModPath::Builtin,
           ..I::default()
         })
         .filter(|_| !with_context)
@@ -735,11 +735,11 @@ impl TypeInfo {
       },
       S::Local { inner_ty_name, .. } => I {
         name: "Local".into(),
-        origin: Origin::Crate,
+        mod_path: ModPath::Crate,
         lifetimes: vec!["s".into()],
         type_args: vec![I {
           name: inner_ty_name.clone().into(),
-          origin: Origin::Crate,
+          mod_path: ModPath::Crate,
           ..I::default()
         }],
         win64_return_value_on_stack: true,
@@ -747,14 +747,14 @@ impl TypeInfo {
       },
       S::MaybeLocal { inner_ty_name, .. } => I {
         name: "Option".into(),
-        origin: Origin::Std("option"),
+        mod_path: ModPath::Std("option"),
         type_args: vec![I {
           name: "Local".into(),
-          origin: Origin::Crate,
+          mod_path: ModPath::Crate,
           lifetimes: vec!["s".into()],
           type_args: vec![I {
             name: inner_ty_name.clone().into(),
-            origin: Origin::Crate,
+            mod_path: ModPath::Crate,
             ..I::default()
           }],
           ..I::default()
@@ -764,36 +764,36 @@ impl TypeInfo {
       },
       S::ModifyCodeGenerationFromStringsResult => I {
         name: "ModifyCodeGenerationFromStringsResult".into(),
-        origin: Origin::Crate,
+        mod_path: ModPath::Crate,
         lifetimes: vec!["s".into()],
         win64_return_value_on_stack: true,
         ..I::default()
       },
       S::PromiseRejectMessage => I {
         name: "PromiseRejectMessage".into(),
-        origin: Origin::Crate,
+        mod_path: ModPath::Crate,
         lifetimes: vec!["s".into()],
         ..I::default()
       },
       S::CallbackInfo { ty_name, .. } => I {
         disposition: D::ConstPtr,
-        origin: Origin::Crate,
+        mod_path: ModPath::CratePrivate("function"),
         name: ty_name.clone().into(),
         ..I::default()
       },
       S::CallbackArguments { ty_name, .. } => I {
         name: ty_name.clone().into(),
-        origin: Origin::Crate,
+        mod_path: ModPath::Crate,
         lifetimes: vec!["s".into()],
         ..I::default()
       },
       S::CallbackReturnValue { ret_ty_name, .. } => I {
         name: "ReturnValue".into(),
-        origin: Origin::Crate,
+        mod_path: ModPath::Crate,
         lifetimes: vec!["s".into()],
         type_args: vec![I {
           name: ret_ty_name.clone().into(),
-          origin: Origin::Crate,
+          mod_path: ModPath::Crate,
           ..I::default()
         }],
         ..I::default()
@@ -806,7 +806,7 @@ impl TypeInfo {
           "String"
         }
         .into(),
-        origin: Origin::Std("string"),
+        mod_path: ModPath::Std("string"),
         ..I::default()
       },
       S::CString { disposition, .. } => I {
@@ -817,13 +817,13 @@ impl TypeInfo {
           "CString"
         }
         .into(),
-        origin: Origin::StdFfi,
+        mod_path: ModPath::StdFfi,
         ..I::default()
       },
       S::CxxString { disposition } => I {
         disposition: *disposition,
         name: "CxxString".into(),
-        origin: Origin::Crate, // Todo: move to mod `support`.
+        mod_path: ModPath::Crate, // Todo: move to mod `support`.
         ..I::default()
       },
       S::Struct {
@@ -832,18 +832,18 @@ impl TypeInfo {
       } => I {
         disposition: *disposition,
         name: ty_name.clone().into(),
-        origin: Origin::Crate,
+        mod_path: ModPath::Crate,
         ..I::default()
       },
       S::Enum { ty_name } => I {
         name: ty_name.clone().into(),
-        origin: Origin::Crate,
+        mod_path: ModPath::Crate,
         ..I::default()
       },
       S::ByteSlice { disposition, .. } => I {
         disposition: disposition.as_native(),
         name: "u8".into(),
-        origin: Origin::Builtin,
+        mod_path: ModPath::Builtin,
         slice: true,
         ..I::default()
       },
