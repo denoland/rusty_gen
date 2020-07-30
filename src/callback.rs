@@ -3,6 +3,7 @@
 use clang::*;
 use std::borrow::Cow;
 use std::cell::Cell;
+use std::collections::BTreeSet;
 use std::collections::HashSet;
 use std::convert::AsRef;
 use std::fmt::{self, Display, Formatter};
@@ -372,6 +373,12 @@ enum SigType<'tu> {
     ty_name: String,
     disposition: Disposition,
   },
+  ByteSlice {
+    disposition: Disposition,
+    ptr_name: String,
+    len_name: String,
+    needs_cast: bool,
+  },
   Struct {
     ty_name: String,
     disposition: Disposition,
@@ -379,21 +386,22 @@ enum SigType<'tu> {
   Enum {
     ty_name: String,
   },
-  ByteSlice {
+  Cell {
     disposition: Disposition,
-    ptr_name: String,
-    len_name: String,
-    needs_cast: bool,
+    inner_ty: Box<SigType<'tu>>,
+    source_ty: Box<SigType<'tu>>,
   },
   Unknown(Type<'tu>),
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 struct DisplayMode {
+  pub for_macro: bool,
+  pub for_doc_code: bool,
   pub raw: bool,
   pub win64_stack_return_fix: bool,
-  pub for_macro: bool,
   pub with_fn_body: bool,
+  pub with_return_lifetime: bool,
 }
 
 thread_local! {
@@ -422,7 +430,6 @@ enum Disposition {
   Owned,
   ConstAuto,
   MutAuto,
-  Cell,
   ConstRef,
   MutRef,
   ConstPtr,
@@ -489,17 +496,6 @@ impl Disposition {
       _ => false,
     }
   }
-
-  pub fn fmt_type(self, ty_name: impl Display) -> String {
-    let DisplayMode { raw, for_macro, .. } = DisplayMode::get();
-    match self {
-      Self::Cell if !raw && for_macro => {
-        format!("&'static ::std::cell::Cell<{}>", ty_name)
-      }
-      Self::Cell if !raw => format!("&'static Cell<{}>", ty_name),
-      _ => format!("{}{}", self, ty_name),
-    }
-  }
 }
 
 impl Display for Disposition {
@@ -513,7 +509,6 @@ impl Display for Disposition {
       Self::ConstPtr => write!(f, "*const "),
       Self::MutPtr => write!(f, "*mut "),
       Self::Owned => Ok(()),
-      Self::Cell => panic!("use Disposition::fmt_type"),
     }
   }
 }
@@ -545,6 +540,7 @@ enum ModPath {
   CratePrivate(&'static str),
   CrateSupport,
   Std(&'static str),
+  StdPrelude(&'static str),
   StdFfi,
   StdRaw,
 }
@@ -557,16 +553,90 @@ impl Default for ModPath {
 
 impl Display for ModPath {
   fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-    match self {
-      Self::Undefined => write!(f, "<??>::"),
-      Self::Builtin => Ok(()),
-      Self::Crate => write!(f, "$crate::"),
-      Self::CratePrivate(submod) => write!(f, "$crate::{}::", submod),
-      Self::CrateSupport => write!(f, "$crate::util::"),
-      Self::Std(submod) if submod.is_empty() => write!(f, "::std::"),
-      Self::Std(submod) => write!(f, "::std::{}::", submod),
-      Self::StdFfi => write!(f, "::std::ffi::"),
-      Self::StdRaw => write!(f, "::std::os::raw::"),
+    match DisplayMode::get() {
+      DisplayMode {
+        for_macro: true,
+        for_doc_code: false,
+        ..
+      } => {
+        match self {
+          // Invariant.
+          Self::Builtin => Ok(()),
+          Self::Undefined => write!(f, "<??>::"),
+          // Crate which is 'rusty_v8' or just 'v8'.
+          Self::Crate => write!(f, "$crate::"),
+          Self::CratePrivate(submod) => {
+            write!(f, "$crate::{}", Self::fmt_submod(submod))
+          }
+          Self::CrateSupport => write!(f, "$crate::support::"),
+          // Std.
+          Self::Std(submod) | Self::StdPrelude(submod) => {
+            write!(f, "::std::{}", Self::fmt_submod(submod))
+          }
+          Self::StdFfi => write!(f, "::std::ffi::"),
+          Self::StdRaw => write!(f, "::std::os::raw::"),
+        }
+      }
+      DisplayMode {
+        for_doc_code: true,
+        for_macro: false,
+        ..
+      } => {
+        match self {
+          // Invariant.
+          Self::Builtin => Ok(()),
+          Self::Undefined => write!(f, "<??>::"),
+          // Crate which is 'rusty_v8' or just 'v8'.
+          Self::Crate => write!(f, "v8::"),
+          Self::CratePrivate(submod) => {
+            write!(f, "v8::{}", Self::fmt_submod(submod))
+          }
+          Self::CrateSupport => write!(f, "v8:support::"),
+          // Std.
+          Self::Std(_) | Self::StdPrelude(_) | Self::StdFfi | Self::StdRaw => {
+            Ok(())
+          }
+        }
+      }
+      _ => Ok(()),
+    }
+  }
+}
+
+impl ModPath {
+  fn fmt_use_stmt(&self, name: &impl Display) -> Option<String> {
+    match DisplayMode::get() {
+      DisplayMode {
+        for_doc_code: true,
+        for_macro: false,
+        ..
+      } => {
+        match self {
+          // Invariant.
+          Self::Builtin => None,
+          Self::Undefined => None,
+          Self::Crate | Self::CratePrivate(_) | Self::CrateSupport => {
+            Some("use rusty_v8 as v8;\n".to_owned())
+          }
+          // Crate which is 'rusty_v8' or just 'v8'.
+          // Std.
+          Self::Std(submod) => {
+            Some(format!("use std::{}{};\n", Self::fmt_submod(submod), name))
+          }
+          Self::StdFfi => Some(format!("use std::ffi::{};\n", name)),
+          Self::StdRaw => Some(format!("use std::os::raw::{};\n", name)),
+          Self::StdPrelude(_) => None,
+        }
+      }
+      _ => unreachable!(),
+    }
+  }
+
+  fn fmt_submod(s: &str) -> Cow<str> {
+    if s.is_empty() {
+      s.into()
+    } else {
+      format!("{}::", s).into()
     }
   }
 }
@@ -596,17 +666,13 @@ impl Display for TypeInfo {
     } else {
       format!("{}<{}>", self.name, angle_bracket_params)
     };
-    let path_and_params = if DisplayMode::get().for_macro {
-      format!("{}{}", self.mod_path, name_and_params)
-    } else {
-      name_and_params
-    };
+    let path_and_params = format!("{}{}", self.mod_path, name_and_params);
     let type_and_params = if self.slice {
       format!("[{}]", path_and_params)
     } else {
       path_and_params
     };
-    write!(f, "{}", self.disposition.fmt_type(type_and_params),)?;
+    write!(f, "{}{}", self.disposition, type_and_params)?;
     Ok(())
   }
 }
@@ -722,7 +788,7 @@ impl TypeInfo {
       S::CallbackScope { with_context, .. } => I {
         disposition: D::MutRef,
         name: "HandleScope".into(),
-        mod_path: ModPath::CratePrivate("scope"),
+        mod_path: ModPath::Crate,
         lifetimes: vec!["s".into()],
         type_args: once(I {
           name: "()".into(),
@@ -747,7 +813,7 @@ impl TypeInfo {
       },
       S::MaybeLocal { inner_ty_name, .. } => I {
         name: "Option".into(),
-        mod_path: ModPath::Std("option"),
+        mod_path: ModPath::StdPrelude("option"),
         type_args: vec![I {
           name: "Local".into(),
           mod_path: ModPath::Crate,
@@ -806,7 +872,7 @@ impl TypeInfo {
           "String"
         }
         .into(),
-        mod_path: ModPath::Std("string"),
+        mod_path: ModPath::StdPrelude("string"),
         ..I::default()
       },
       S::CString { disposition, .. } => I {
@@ -826,6 +892,13 @@ impl TypeInfo {
         mod_path: ModPath::Crate, // Todo: move to mod `support`.
         ..I::default()
       },
+      S::ByteSlice { disposition, .. } => I {
+        disposition: disposition.as_native(),
+        name: "u8".into(),
+        mod_path: ModPath::Builtin,
+        slice: true,
+        ..I::default()
+      },
       S::Struct {
         disposition,
         ty_name,
@@ -840,11 +913,15 @@ impl TypeInfo {
         mod_path: ModPath::Crate,
         ..I::default()
       },
-      S::ByteSlice { disposition, .. } => I {
+      S::Cell {
+        disposition,
+        inner_ty,
+        ..
+      } => I {
         disposition: disposition.as_native(),
-        name: "u8".into(),
-        mod_path: ModPath::Builtin,
-        slice: true,
+        name: "Cell".into(),
+        mod_path: ModPath::Std("cell"),
+        type_args: vec![TypeInfo::from(inner_ty)],
         ..I::default()
       },
       S::Unknown(ty) => I {
@@ -853,6 +930,29 @@ impl TypeInfo {
       },
     }
   }
+}
+
+fn collect_use_smts(
+  type_infos: impl IntoIterator<Item = TypeInfo>,
+) -> impl IntoIterator<Item = String> {
+  type_infos
+    .into_iter()
+    .flat_map(|ti| {
+      once(ti.mod_path.fmt_use_stmt(&ti.name))
+        .filter_map(|opt| opt)
+        .chain(collect_use_smts(ti.type_args).into_iter())
+    })
+    .collect::<BTreeSet<String>>()
+}
+
+fn generate_use_stmts<'tu>(sigs: &[Sig<'tu>], mode: DisplayMode) -> String {
+  DisplayMode::set(mode);
+  let type_infos = sigs
+    .iter()
+    .cloned()
+    .map(|sig| sig.ty)
+    .map(|ty| TypeInfo::from(&ty));
+  collect_use_smts(type_infos).into_iter().collect::<String>()
 }
 
 fn collect_named_lifetime_params<I>(type_infos: I) -> Vec<Lifetime>
@@ -878,7 +978,6 @@ where
 
 fn generate_angle_bracket_params<'tu>(
   sigs: &[Sig<'tu>],
-  include_return_type: bool,
   mode: DisplayMode,
   wrap_fn: impl Fn(String) -> String,
 ) -> String {
@@ -893,7 +992,7 @@ fn generate_angle_bracket_params<'tu>(
       Sig {
         id: SigIdent::Return,
         ty,
-      } if include_return_type => Some(ty),
+      } if mode.with_return_lifetime => Some(ty),
       _ => None,
     })
     .map(|ty| TypeInfo::from(ty));
@@ -932,7 +1031,7 @@ impl<'tu> Sig<'tu> {
     }
   }
 
-  pub fn generate_call_signature<R>(
+  pub fn generate_call_params<R>(
     &self,
     rest: R,
     with_types: bool,
@@ -953,7 +1052,7 @@ impl<'tu> Sig<'tu> {
       let next = rest.next();
       next
         .map(|n| {
-          n.generate_call_signature(
+          n.generate_call_params(
             rest,
             with_types,
             with_names,
@@ -1245,19 +1344,16 @@ impl<'tu> Sig<'tu> {
       Sig {
         id: SigIdent::Return,
         ty:
-          SigType::IntFixedSize {
-            disposition: Disposition::Cell,
-            signed,
-            bits: 32,
+          SigType::Cell {
+            disposition: Disposition::ConstAuto,
+            source_ty,
+            ..
           },
       } => format!(
         "{}.as_ptr()",
         Sig {
           id: SigIdent::Return,
-          ty: SigType::Int {
-            disposition: Disposition::MutPtr,
-            signed: *signed
-          }
+          ty: *source_ty.clone()
         }
         .gather_raw_to_native_conversions(rest)
       ),
@@ -1500,7 +1596,7 @@ fn generate_call_params<'tu>(
 ) -> String {
   DisplayMode::set(mode);
   let call_params = gather_recursively_with(sigs.to_owned(), |first, rest| {
-    first.generate_call_signature(
+    first.generate_call_params(
       rest,
       with_types,
       with_names,
@@ -1654,10 +1750,25 @@ fn convert_raw_signature_to_native<'tu>(sigs: &[Sig<'tu>]) -> Vec<Sig<'tu>> {
     .iter()
     .cloned()
     .map(|sig| match sig {
-      // Change the return type to an &'static Cell if the function has a &mut i32
-      // output and no scope.
-      Sig { id: SigIdent::Return, ty: SigType::Int { disposition, signed }} if disposition.is_mut_address() && !has_scope => {
-        Sig { id: SigIdent::Return, ty: SigType::Int { disposition: Disposition::Cell, signed }}
+      // Change the return type to an &'static Cell if the function returns a
+      // `&mut int` but it has no scope or any other parameter that the lifetime
+      // of the return value can be bound to.
+      Sig {
+        id: SigIdent::Return,
+        ty: SigType::Int { disposition, signed }
+      } if disposition.is_mut_address() && !has_scope => {
+        Sig {
+          id: SigIdent::Return,
+          ty: SigType::Cell {
+            disposition: Disposition::ConstAuto,
+            inner_ty: Box::new(SigType::IntFixedSize {
+              bits: 32,
+              signed,
+              disposition: Disposition::Owned
+            }),
+            source_ty: Box::new(sig.ty)
+          }
+        }
       },
       sig => sig
     })
@@ -1778,7 +1889,7 @@ fn convert_raw_signature_to_native<'tu>(sigs: &[Sig<'tu>]) -> Vec<Sig<'tu>> {
     }})
     // Move any `void* data` user data field to the end of the parameter list,
     // unless it is "histogram".
-    .map(|sig| Some(sig))
+    .map(Some)
     .chain(once(None))
     .scan(None, |hold, sig| {
       Some(match sig {
@@ -1842,30 +1953,31 @@ fn render_callback_definition<'tu>(
   let cb_comment_or_separator = cb_comment
     .map(format_comment)
     .unwrap_or_else(|| format!("// === {} ===\n", &cb_name_uc));
-  let for_lifetimes_native = generate_angle_bracket_params(
+  let use_stmts_example = generate_use_stmts(
     sigs_native,
-    false,
-    DisplayMode::default(),
-    |s| format!("for<{}> ", s),
+    DisplayMode {
+      for_doc_code: true,
+      ..Default::default()
+    },
   );
+  let for_lifetimes_native =
+    generate_angle_bracket_params(sigs_native, DisplayMode::default(), |s| {
+      format!("for<{}> ", s)
+    });
   let for_lifetimes_native_for_macro = generate_angle_bracket_params(
     sigs_native,
-    false,
     DisplayMode {
       for_macro: true,
       ..Default::default()
     },
     |s| format!("for<{}> ", s),
   );
-  let lifetimes_native = generate_angle_bracket_params(
-    sigs_native,
-    false,
-    DisplayMode::default(),
-    |s| format!("<{}>", s),
-  );
+  let lifetimes_native =
+    generate_angle_bracket_params(sigs_native, DisplayMode::default(), |s| {
+      format!("<{}>", s)
+    });
   let for_lifetimes_in_raw = generate_angle_bracket_params(
     sigs_raw,
-    false,
     DisplayMode {
       raw: true,
       ..Default::default()
@@ -1874,16 +1986,15 @@ fn render_callback_definition<'tu>(
   );
   let for_lifetimes_inout_raw = generate_angle_bracket_params(
     sigs_raw,
-    true,
     DisplayMode {
       raw: true,
+      with_return_lifetime: true,
       ..Default::default()
     },
     |s| format!("for<{}> ", s),
   );
   let lifetimes_in_raw_comma = generate_angle_bracket_params(
     sigs_raw,
-    false,
     DisplayMode {
       raw: true,
       ..Default::default()
@@ -1892,9 +2003,9 @@ fn render_callback_definition<'tu>(
   );
   let lifetimes_inout_raw_comma = generate_angle_bracket_params(
     sigs_raw,
-    true,
     DisplayMode {
       raw: true,
+      with_return_lifetime: true,
       ..Default::default()
     },
     |s| format!("{}, ", s),
@@ -1971,6 +2082,7 @@ fn render_callback_definition<'tu>(
   let call_params_full_native_example = generate_call_params(
     sigs_native,
     DisplayMode {
+      for_doc_code: true,
       with_fn_body: true,
       ..Default::default()
     },
@@ -2012,13 +2124,17 @@ fn render_callback_definition<'tu>(
   );
   let raw_to_native_conversions = gather_raw_to_native_conversions(sigs_native);
 
+  let end_of_boilerplate_marker = "// #### END OF BOILERPLATE #### //";
   let example_code_comment = cb_comment.iter()
     .map(|_| "///\n".to_owned())
-    .chain(once("/// ## Example\n///\n/// ```ignore\n".to_owned()))
+    .chain(once("/// ## Example\n///\n/// ```\n".to_owned()))
     .chain(
       rustfmt(
         &format!(
-          "fn {cb_name_lc}_example{lifetimes_native}{call_params_full_native_example}",
+          "{use_stmts_example}{end_of_boilerplate_marker}\n\
+          fn {cb_name_lc}_example{lifetimes_native}{call_params_full_native_example}",
+          use_stmts_example = use_stmts_example,
+          end_of_boilerplate_marker = end_of_boilerplate_marker,
           cb_name_lc = cb_name_lc,
           lifetimes_native = lifetimes_native,
           call_params_full_native_example = call_params_full_native_example
@@ -2026,7 +2142,18 @@ fn render_callback_definition<'tu>(
         Some(76),
       )
       .lines()
-      .map(|l| format!("/// {}\n", l)),
+      .scan(true, |is_boilerplate, line|  Some( {
+        if line.trim() == end_of_boilerplate_marker {
+          let was_boilerplate = take(is_boilerplate);
+          assert!(was_boilerplate);
+          "/// #\n".to_owned() // Replace by empty line.
+        } else if *is_boilerplate {
+          format!("/// # {}\n", line)
+        } else {
+          format!("/// {}\n", line)
+        }
+      }))
+      .map(|line| line.replace(" \n", "\n"))
     )
     .chain(once("/// ```".to_owned()))
     .collect::<String>();
@@ -2453,6 +2580,8 @@ use std::os::raw::c_int;
 use std::os::raw::c_uchar;
 use std::slice;
 
+use crate::function::FunctionCallbackInfo;
+use crate::function::PropertyCallbackInfo;
 use crate::scope::CallbackScope;
 use crate::support::Opaque;
 use crate::support::UnitType;
@@ -2460,7 +2589,6 @@ use crate::Array;
 use crate::Boolean;
 use crate::Context;
 use crate::FunctionCallbackArguments;
-use crate::FunctionCallbackInfo;
 use crate::HandleScope;
 use crate::Integer;
 use crate::Isolate;
@@ -2472,7 +2600,6 @@ use crate::Object;
 use crate::Promise;
 use crate::PromiseRejectMessage;
 use crate::PropertyCallbackArguments;
-use crate::PropertyCallbackInfo;
 use crate::ReturnValue;
 use crate::ScriptOrModule;
 use crate::SharedArrayBuffer;
