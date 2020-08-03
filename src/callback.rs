@@ -311,6 +311,9 @@ enum SigType<'tu> {
   Void {
     disposition: Disposition,
   },
+  Unit {
+    disposition: Disposition,
+  },
   Bool,
   Char {
     disposition: Disposition,
@@ -686,15 +689,24 @@ impl TypeInfo {
     match sig {
       S::Void {
         disposition: D::Owned,
+      }
+      | S::Unit {
+        disposition: D::Owned,
       } => I {
         name: "()".into(),
         mod_path: ModPath::Builtin,
         ..I::default()
       },
       S::Void { disposition } => I {
-        disposition: disposition.as_raw(),
+        disposition: *disposition,
         name: "c_void".into(),
         mod_path: ModPath::StdFfi,
+        ..I::default()
+      },
+      S::Unit { disposition } => I {
+        disposition: *disposition,
+        name: "()".into(),
+        mod_path: ModPath::Builtin,
         ..I::default()
       },
       S::Bool => I {
@@ -1123,7 +1135,7 @@ impl<'tu> Sig<'tu> {
           fmt_body(" {\n  todo!()\n}")
         )
       }
-      Sig { id: I::Return, ty } if ty.is_void() => format!(
+      Sig { id: I::Return, ty } if ty.is_nothing_return_value() => format!(
         "(\n{}    ){}\n",
         gen_rest(rest),
         fmt_body(" {\n  todo!();\n}")
@@ -1136,7 +1148,6 @@ impl<'tu> Sig<'tu> {
         if !rti.lifetimes.is_empty() {
           let param_lifetimes = rest
             .clone()
-            .into_iter()
             .map(|sig| TypeInfo::from(&sig.ty))
             .flat_map(|ti| ti.lifetimes.into_iter())
             .collect::<HashSet<_>>();
@@ -1342,6 +1353,16 @@ impl<'tu> Sig<'tu> {
         )
       }
       Sig {
+        id: SigIdent::Param(Some(name)),
+        ty: SigType::Unit { disposition },
+      } if *disposition != Disposition::Owned => format!(
+        "  let {} = {} as {} ();\n{}",
+        name,
+        name,
+        disposition,
+        gen_rest(rest)
+      ),
+      Sig {
         id: SigIdent::Return,
         ty:
           SigType::Cell {
@@ -1356,6 +1377,20 @@ impl<'tu> Sig<'tu> {
           ty: *source_ty.clone()
         }
         .gather_raw_to_native_conversions(rest)
+      ),
+      Sig {
+        id: SigIdent::Return,
+        ty: SigType::Unit { disposition },
+      } if *disposition != Disposition::Owned => format!(
+        "{} as {} c_void",
+        Sig {
+          id: SigIdent::Return,
+          ty: SigType::Void {
+            disposition: *disposition
+          }
+        }
+        .gather_raw_to_native_conversions(rest),
+        disposition.as_raw()
       ),
       sig @ Sig {
         id: SigIdent::Return,
@@ -1553,9 +1588,12 @@ impl<'tu> SigType<'tu> {
     }
   }
 
-  fn is_void(&self) -> bool {
+  fn is_nothing_return_value(&self) -> bool {
     match self {
       Self::Void {
+        disposition: Disposition::Owned,
+      } => true,
+      Self::Unit {
         disposition: Disposition::Owned,
       } => true,
       _ => false,
@@ -1900,10 +1938,17 @@ fn convert_raw_signature_to_native<'tu>(sigs: &[Sig<'tu>]) -> Vec<Sig<'tu>> {
           replace(hold, sig)
         },
         Some(_) => sig,
-        None => replace(hold, None)
+        None => hold.take()
       })
     })
     .filter_map(|opt_sig: Option<Sig>| opt_sig)
+    // Convert all `c_void` to `()`.
+    .map(|sig| match sig {
+        Sig {
+          id, ty: SigType::Void { disposition }
+        } => Sig { id, ty: SigType::Unit { disposition: disposition.as_raw() } },
+      _ => sig
+    })
     .collect::<Vec<_>>()
 }
 
@@ -2142,11 +2187,15 @@ fn render_callback_definition<'tu>(
         Some(76),
       )
       .lines()
-      .scan(true, |is_boilerplate, line|  Some( {
+      .enumerate()
+      .scan(true, |is_boilerplate, (lno, line)|  Some( {
         if line.trim() == end_of_boilerplate_marker {
           let was_boilerplate = take(is_boilerplate);
           assert!(was_boilerplate);
-          "/// #\n".to_owned() // Replace by empty line.
+          match lno {
+            0 => "".to_owned(), // Drop if on first line.
+            _ => "/// #\n".to_owned() // Insert spacer if not on first line.
+          }
         } else if *is_boilerplate {
           format!("/// # {}\n", line)
         } else {
@@ -2288,28 +2337,28 @@ fn mock_{cb_name_lc}{lifetimes_native}{call_params_full_native_notused} {{
 }}
 
 #[test]
-fn {cb_name_lc}_type_param() {{
-  fn pass_by_type_param<F: Into{cb_name_uc}>(_: F) -> {cb_name_uc} {{
+fn {cb_name_lc}_as_type_param() {{
+  fn pass_as_type_param<F: Into{cb_name_uc}>(_: F) -> {cb_name_uc} {{
     F::get().into()
   }}
-  let _ = pass_by_type_param(mock_{cb_name_lc});
+  let _ = pass_as_type_param(mock_{cb_name_lc});
 }}
 
 #[test]
-fn {cb_name_lc}_impl_into_trait() {{
-  fn pass_by_impl_into_trait(f: impl Into<{cb_name_uc}>) -> {cb_name_uc} {{
+fn {cb_name_lc}_as_impl_into_trait() {{
+  fn pass_as_impl_into_trait(f: impl Into<{cb_name_uc}>) -> {cb_name_uc} {{
     f.into()
   }}
-  let _ = pass_by_impl_into_trait(mock_{cb_name_lc});
+  let _ = pass_as_impl_into_trait(mock_{cb_name_lc});
 }}
 
 #[test]
-fn {cb_name_lc}_impl_into_macro() {{
-  fn pass_by_impl_into_macro(f: impl_into_{cb_name_lc}!()) -> {cb_name_uc} {{
+fn {cb_name_lc}_as_impl_into_macro() {{
+  fn pass_as_impl_into_macro(f: impl_into_{cb_name_lc}!()) -> {cb_name_uc} {{
     f.into()
   }}
-  let _ = pass_by_impl_into_macro(mock_{cb_name_lc});
-  let _ = pass_by_impl_into_macro({call_param_names_native_closure_notused} unimplemented!());
+  let _ = pass_as_impl_into_macro(mock_{cb_name_lc});
+  let _ = pass_as_impl_into_macro({call_param_names_native_closure_notused} unimplemented!());
 }}
 "#,
     cb_name_uc = cb_name_uc,
