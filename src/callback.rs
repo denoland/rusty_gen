@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 
 use clang::*;
+use lazy_static::lazy_static;
+use regex::Regex;
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::BTreeSet;
@@ -110,6 +112,8 @@ fn get_flat_name_for_callback_type(e: Entity) -> String {
     .replace("CallbackFunction", "Fn")
     .replace("CallbackCallback", "Callback")
     .replace("CallbackInfoCallback", "Callback")
+    .trim_end_matches("WithData")
+    .to_owned()
 }
 
 fn to_snake_case(s: impl AsRef<str>) -> String {
@@ -172,27 +176,58 @@ fn is_type_used(translation_unit: &TranslationUnit, ty: Type) -> bool {
   })
 }
 
-fn where_is_type_used<'tu>(
-  translation_unit: &'tu TranslationUnit<'tu>,
-  ty: Type<'tu>,
-) -> Vec<Entity<'tu>> {
+fn where_is_type_used<'tu>(e: Entity<'tu>) -> Vec<Entity<'tu>> {
+  let tu = e.get_translation_unit();
+  let ty = match e.get_type() {
+    Some(ty) => ty,
+    None => return Vec::default(),
+  };
   let can_ty = ty.get_canonical_type();
-  let root = translation_unit.get_entity();
+  let root = tu.get_entity();
   let mut refs = Vec::<Entity>::new();
+  let mut aliases = Vec::<Entity>::new();
   root.visit_children(|e, _| {
     if e.get_storage_class().is_some()
-      && e
-        .get_type()
-        .map(|var_ty| var_ty.get_canonical_type() == can_ty)
-        .unwrap_or(false)
+      && e.get_type().map(|ty2| ty2 == ty).unwrap_or(false)
     {
       refs.push(e);
+      EntityVisitResult::Continue
+    } else if e
+      .get_type()
+      .map(|ty2| ty2.get_canonical_type())
+      .map(|can_ty_2| can_ty == can_ty_2)
+      .unwrap_or(false)
+      && (ty.get_kind() == TypeKind::Typedef
+        || ty.get_kind() == TypeKind::Elaborated
+        || ty.get_kind() == TypeKind::Unexposed)
+    {
+      aliases.push(e);
       EntityVisitResult::Continue
     } else {
       EntityVisitResult::Recurse
     }
   });
+  refs.extend(aliases.into_iter());
   refs
+}
+
+fn has_sibling_type_with_data(e: Entity) -> bool {
+  let name = e.get_name().unwrap();
+  let name_with_data = format!("{}WithData", name);
+  let root = e.get_translation_unit().get_entity();
+  root.visit_children(|e, _| {
+    if Some(e)
+      .filter(|e| e.get_typedef_underlying_type().is_some())
+      .and_then(|e| e.get_name())
+      .filter(|name2| name2 == &name_with_data)
+      .map(|_| true)
+      .unwrap_or(false)
+    {
+      EntityVisitResult::Break
+    } else {
+      EntityVisitResult::Recurse
+    }
+  })
 }
 
 enum TypeParams<'tu> {
@@ -238,10 +273,10 @@ fn is_void_type<'tu>(ty: Type<'tu>) -> bool {
 }
 
 fn get_type_name<'tu>(ty: Type<'tu>) -> Option<String> {
-  match ty.get_declaration() {
-    Some(d) => d.get_name(),
+  match ty.get_declaration().and_then(|e| e.get_name()) {
+    Some(name) => Some(name),
     None if is_void_type(ty) => Some("void".to_owned()),
-    None => None,
+    None => ty.get_pointee_type().and_then(get_type_name),
   }
 }
 
@@ -1971,8 +2006,11 @@ fn return_value_requires_win64_stack_return_fix<'tu>(
 }
 
 fn format_comment(comment: &str) -> String {
+  lazy_static! {
+    static ref PIPES_RE: Regex = Regex::new(r"\|([\S]+)\|").unwrap();
+  }
   let delims: &[_] = &['/', '*', ' ', '\n'];
-  comment
+  let comment = comment
     .trim_start_matches(delims)
     .trim_end_matches(delims)
     .replacen("", "/// ", 1)
@@ -1982,12 +2020,15 @@ fn format_comment(comment: &str) -> String {
     .replace("\n *\n", "\n///\n")
     .replace("\\code", "```ignore")
     .replace("\\endcode", "```")
-    .replace(".  ", ". ")
+    .replace(".  ", ". ");
+  let comment = PIPES_RE.replace_all(&comment, "`$1`");
+  comment.into()
 }
 
 fn render_callback_definition<'tu>(
   cb_name: &str,
   cb_comment: Option<&str>,
+  used_for_comment: &str,
   sigs_native: &[Sig<'tu>],
   sigs_raw: &[Sig<'tu>],
   used_inputs: HashSet<String>,
@@ -2210,7 +2251,7 @@ fn render_callback_definition<'tu>(
   let common_code = format!(
     r#"
 {cb_comment_or_separator}
-{example_code_comment}
+{used_for_comment}{example_code_comment}
 #[derive(Copy, Clone)]
 #[repr(transparent)]
 pub struct {cb_name_uc}(Raw{cb_name_uc});
@@ -2238,6 +2279,7 @@ macro_rules! impl_into_{cb_name_lc} {{
     cb_name_uc = cb_name_uc,
     cb_name_lc = cb_name_lc,
     cb_comment_or_separator = cb_comment_or_separator,
+    used_for_comment = used_for_comment,
     example_code_comment = example_code_comment,
     for_lifetimes_native = for_lifetimes_native,
     for_lifetimes_native_for_macro = for_lifetimes_native_for_macro,
@@ -2387,6 +2429,21 @@ fn comment_out(code: String) -> String {
     .collect::<String>()
 }
 
+fn get_used_for_comment<'tu>(e: Entity<'tu>) -> String {
+  where_is_type_used(e)
+    .into_iter()
+    .map(|e| -> Option<String> {
+      let vn = e.get_display_name()?;
+      let pn = e.get_semantic_parent()?.get_display_name()?;
+      let s = format!("{}::{}", pn, vn);
+      Some(s)
+    })
+    .map(|o| o.unwrap_or_else(|| format!("?? e{:?}", e)))
+    .map(|n| format!("/// @@  {}\n", n))
+    .collect::<String>();
+  Default::default()
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum CallbackTranslationError {
   GetResultTypeFailed,
@@ -2418,12 +2475,14 @@ fn visit_callback_definition<'tu>(
   let sigs_native = convert_raw_signature_to_native(&sigs_raw);
   let used_inputs = gather_used_inputs(&sigs_native);
   let use_win64fix = return_value_requires_win64_stack_return_fix(&sigs_raw);
+  let used_for_comment = get_used_for_comment(e);
   if let Some(unk_ty_names) = contains_unknown_cxx_types(&sigs_raw) {
     Err(CallbackTranslationError::UnknownType(unk_ty_names))
   } else {
     Ok(render_callback_definition(
       &cb_name,
       cb_comment.as_deref(),
+      &used_for_comment,
       &sigs_native,
       &sigs_raw,
       used_inputs,
@@ -2441,27 +2500,21 @@ fn visit_declaration<'tu>(
       if ty.get_kind() == TypeKind::Pointer {
         if let Some(pointee_ty) = ty.get_pointee_type() {
           if pointee_ty.get_kind() == TypeKind::FunctionPrototype {
-            if is_type_used(e.get_translation_unit(), ty) {
+            let tu = e.get_translation_unit();
+            if has_sibling_type_with_data(e) {
+              eprintln!(
+                "Skipped: `{name}`: because `{name}WithData` exists",
+                name = e.get_name().unwrap_or_default()
+              );
+            } else if !is_type_used(tu, ty) {
+              eprintln!("Not used: `{}`", ty.get_display_name());
+            } else {
               match visit_callback_definition(e, pointee_ty) {
-                //index.extend(
-                //  where_is_type_used(e.get_translation_unit(), ty)
-                //    .into_iter()
-                //    .map(|e| -> Option<String> {
-                //      let vn = e.get_display_name()?;
-                //      let pn = e.get_semantic_parent()?.get_display_name()?;
-                //      let s = format!("{}::{}", pn, vn);
-                //      Some(s)
-                //    })
-                //    .map(|o| o.unwrap_or_else(|| format!("{:?}", e)))
-                //    .map(|n| format!("// @ - {}", n))
-                //);
                 Ok(code) => index.push(code),
                 Err(e) => {
                   eprintln!("Skipped: `{}`: {:?}", ty.get_display_name(), e)
                 }
               }
-            } else {
-              eprintln!("Not used: `{}`", ty.get_display_name());
             }
           }
         }
@@ -2507,7 +2560,7 @@ pub fn generate(tu: &TranslationUnit) {
 }
 
 fn rustfmt(code: &str, max_width: Option<u32>) -> String {
-  run_rustfmt(code, max_width, true)
+  run_rustfmt(code, max_width, false)
     .or_else(|_| run_rustfmt(code, max_width, false))
     .unwrap()
 }
