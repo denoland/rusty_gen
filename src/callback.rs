@@ -247,7 +247,9 @@ fn has_sibling_type_with_extra_param(e: Entity) -> bool {
       .filter(|e| e.get_typedef_underlying_type().is_some())
       .and_then(|e| e.get_name())
       .filter(|name2| {
-        (&name != name2) && (name == trim_extra_param_suffix(name2))
+        let var_name =
+          { (&name != name2) && (name == trim_extra_param_suffix(name2)) };
+        var_name
       })
       .map(|_| true)
       .unwrap_or(false)
@@ -297,11 +299,11 @@ fn is_v8_isolate_type_pointee<'tu>(
     .and_then(|ty| is_v8_isolate_type(ty, name))
 }
 
-fn is_void_type<'tu>(ty: Type<'tu>) -> bool {
+fn is_void_type(ty: Type) -> bool {
   ty.get_kind() == TypeKind::Void
 }
 
-fn get_type_name<'tu>(ty: Type<'tu>) -> Option<String> {
+fn get_type_name(ty: Type) -> Option<String> {
   match ty.get_declaration().and_then(|e| e.get_name()) {
     Some(name) => Some(name),
     None if is_void_type(ty) => Some("void".to_owned()),
@@ -309,7 +311,7 @@ fn get_type_name<'tu>(ty: Type<'tu>) -> Option<String> {
   }
 }
 
-fn get_type_params<'tu>(ty: Type<'tu>) -> Option<TypeParams<'tu>> {
+fn get_type_params(ty: Type) -> Option<TypeParams> {
   let mut ptys = ty.get_template_argument_types()?.into_iter();
   let pty1 = ptys.next();
   let pty2 = pty1.and_then(|_| ptys.next());
@@ -346,13 +348,25 @@ fn is_std_or_root_ns(mut e: Entity) -> bool {
   }
 }
 
+fn is_root_type<'tu>(ty: Type<'tu>, name: &str) -> bool {
+  ty.get_declaration()
+    .map(|d| d.get_definition().unwrap_or(d))
+    .filter(|d| d.get_name().map(|n| n == name).unwrap_or(false))
+    .filter(|d| {
+      get_named_semantic_parent(*d)
+        .map(|e| e.get_kind() == EntityKind::TranslationUnit)
+        .unwrap_or(false)
+    })
+    .is_some()
+}
+
 fn is_std_type<'tu>(ty: Type<'tu>, name: &str) -> bool {
   ty.get_declaration()
     .map(|d| d.get_definition().unwrap_or(d))
     .filter(|d| d.get_name().map(|n| n == name).unwrap_or(false))
     .filter(|d| {
       get_named_semantic_parent(*d)
-        .map(|p| is_std_or_root_ns(p))
+        .map(is_std_or_root_ns)
         .unwrap_or(false)
     })
     .is_some()
@@ -450,6 +464,10 @@ enum SigType<'tu> {
     ty_name: String,
     disposition: Disposition,
   },
+  WindowsOnlyStruct {
+    ty_name: String,
+    disposition: Disposition,
+  },
   Enum {
     ty_name: String,
   },
@@ -537,31 +555,19 @@ impl Disposition {
   }
 
   pub fn is_owned(self) -> bool {
-    match self {
-      Self::Owned => true,
-      _ => false,
-    }
+    matches!(self, Self::Owned)
   }
 
   pub fn is_address(self) -> bool {
-    match self {
-      Self::Owned => false,
-      _ => true,
-    }
+    !matches!(self, Self::Owned)
   }
 
   pub fn is_const_address(self) -> bool {
-    match self {
-      Self::ConstAuto | Self::ConstRef | Self::ConstPtr => true,
-      _ => false,
-    }
+    matches!(self, Self::ConstAuto | Self::ConstRef | Self::ConstPtr)
   }
 
   pub fn is_mut_address(self) -> bool {
-    match self {
-      Self::MutAuto | Self::MutRef | Self::MutPtr => true,
-      _ => false,
-    }
+    matches!(self, Self::MutAuto | Self::MutRef | Self::MutPtr)
   }
 }
 
@@ -978,6 +984,10 @@ impl TypeInfo {
       S::Struct {
         disposition,
         ty_name,
+      }
+      | S::WindowsOnlyStruct {
+        disposition,
+        ty_name,
       } => I {
         disposition: *disposition,
         name: ty_name.clone().into(),
@@ -1315,6 +1325,10 @@ impl<'tu> Sig<'tu> {
       | Sig {
         id: SigIdent::Param(Some(name)),
         ty: SigType::Struct { disposition, .. },
+      }
+      | Sig {
+        id: SigIdent::Param(Some(name)),
+        ty: SigType::WindowsOnlyStruct { disposition, .. },
       } if disposition.is_address() => format!(
         "  let {} = unsafe {{ {}*{} }};\n{}",
         name,
@@ -1507,11 +1521,9 @@ impl<'tu> From<Type<'tu>> for SigType<'tu> {
       }
     } else if ty.get_kind() == K::Bool {
       M::Bool
-    } else if let Some(pty) =
-      ty.get_pointee_type().filter(|pty| match pty.get_kind() {
-        K::CharS | K::CharU => true,
-        _ => false,
-      })
+    } else if let Some(pty) = ty
+      .get_pointee_type()
+      .filter(|pty| matches!(pty.get_kind(), K::CharS | K::CharU))
     {
       M::Char {
         disposition: Disposition::auto(pty),
@@ -1634,6 +1646,15 @@ impl<'tu> From<Type<'tu>> for SigType<'tu> {
         ty_name: "AtomicsWaitWakeHandle".to_owned(),
         disposition: Disposition::auto(pty),
       }
+    } else if ty
+      .get_pointee_type()
+      .map(|pty| is_root_type(pty, "_EXCEPTION_POINTERS"))
+      .unwrap_or_default()
+    {
+      M::WindowsOnlyStruct {
+        ty_name: "EXCEPTION_POINTERS".to_owned(),
+        disposition: Disposition::ConstAuto,
+      }
     } else if ty.get_kind() == TypeKind::Enum && ty.get_sizeof().unwrap() == 4 {
       M::Enum {
         ty_name: get_type_name(ty).unwrap(),
@@ -1646,10 +1667,7 @@ impl<'tu> From<Type<'tu>> for SigType<'tu> {
 
 impl<'tu> SigType<'tu> {
   fn is_unknown(&self) -> bool {
-    match self {
-      Self::Unknown(..) => true,
-      _ => false,
-    }
+    matches!(self, Self::Unknown(..))
   }
 
   fn is_nothing_return_value(&self) -> bool {
@@ -1697,7 +1715,7 @@ fn generate_call_params<'tu>(
   used_inputs: Option<&HashSet<String>>,
 ) -> String {
   DisplayMode::set(mode);
-  let call_params = gather_recursively_with(sigs.to_owned(), |first, rest| {
+  gather_recursively_with(sigs.to_owned(), |first, rest| {
     first.generate_call_params(
       rest,
       with_types,
@@ -1705,8 +1723,7 @@ fn generate_call_params<'tu>(
       closure_style,
       used_inputs,
     )
-  });
-  call_params
+  })
 }
 
 fn contains_unknown_cxx_types<'tu>(sigs: &[Sig<'tu>]) -> Option<Vec<String>> {
@@ -1725,6 +1742,16 @@ fn contains_unknown_cxx_types<'tu>(sigs: &[Sig<'tu>]) -> Option<Vec<String>> {
   } else {
     Some(unk)
   }
+}
+
+fn contains_windows_only_types<'tu>(sigs: &[Sig<'tu>]) -> bool {
+  sigs.iter().any(|sig| match sig {
+    Sig {
+      ty: SigType::WindowsOnlyStruct { .. },
+      ..
+    } => true,
+    _ => false,
+  })
 }
 
 fn gather_raw_to_native_conversions<'tu>(sigs: &[Sig<'tu>]) -> String {
@@ -2062,12 +2089,19 @@ fn render_callback_definition<'tu>(
   sigs_raw: &[Sig<'tu>],
   used_inputs: HashSet<String>,
   use_win64fix: bool,
+  windows_only: bool,
 ) -> String {
   let cb_name_uc = cb_name;
   let cb_name_lc = to_snake_case(&cb_name);
   let cb_comment_or_separator = cb_comment
     .map(format_comment)
     .unwrap_or_else(|| format!("// === {} ===\n", &cb_name_uc));
+  let target_attr = if windows_only {
+    "#[cfg(target_family = \"windows\")]\n"
+  } else {
+    ""
+  }
+  .to_owned();
   let use_stmts_example = generate_use_stmts(
     sigs_native,
     DisplayMode {
@@ -2242,7 +2276,7 @@ fn render_callback_definition<'tu>(
   let end_of_boilerplate_marker = "// #### END OF BOILERPLATE #### //";
   let example_code_comment = cb_comment.iter()
     .map(|_| "///\n".to_owned())
-    .chain(once("/// ## Example\n///\n/// ```\n".to_owned()))
+    .chain(once("/// # Example\n///\n/// ```\n".to_owned()))
     .chain(
       rustfmt(
         &format!(
@@ -2281,27 +2315,20 @@ fn render_callback_definition<'tu>(
     r#"
 {cb_comment_or_separator}
 {used_for_comment}{example_code_comment}
-#[derive(Copy, Clone)]
-#[repr(transparent)]
-pub struct {cb_name_uc}(Raw{cb_name_uc});
-
-pub trait Into{cb_name_uc}:
+{target_attr}pub trait {cb_name_uc}:
   UnitType
-  + Into<{cb_name_uc}>
   + {for_lifetimes_native}FnOnce{call_param_types_native}
 {{ }}
 
-impl<F> Into{cb_name_uc} for F where
+{target_attr}impl<F> {cb_name_uc} for F where
   F: UnitType
-    + Into<{cb_name_uc}>
     + {for_lifetimes_native}FnOnce{call_param_types_native}
 {{ }}
 
-#[macro_export]
-macro_rules! impl_into_{cb_name_lc} {{
+{target_attr}#[macro_export]
+macro_rules! impl_{cb_name_lc} {{
   () => {{
-    impl $crate::support::UnitType
-    + ::std::convert::Into<$crate::{cb_name_uc}>
+    impl $crate::{cb_name_uc}
     + {for_lifetimes_native_for_macro}::std::ops::FnOnce{call_param_types_native_for_macro}  }};
 }}
 "#,
@@ -2309,6 +2336,7 @@ macro_rules! impl_into_{cb_name_lc} {{
     cb_name_lc = cb_name_lc,
     cb_comment_or_separator = cb_comment_or_separator,
     used_for_comment = used_for_comment,
+    target_attr = target_attr,
     example_code_comment = example_code_comment,
     for_lifetimes_native = for_lifetimes_native,
     for_lifetimes_native_for_macro = for_lifetimes_native_for_macro,
@@ -2319,16 +2347,15 @@ macro_rules! impl_into_{cb_name_lc} {{
   let abi_specific_code = if !use_win64fix {
     format!(
       r#"
-type Raw{cb_name_uc} = {for_lifetimes_in_raw}extern "C" fn{call_param_types_raw};
+{target_attr}#[repr(transparent)]
+pub(crate) struct Raw{cb_name_uc}(
+  {for_lifetimes_in_raw}extern "C" fn{call_param_types_raw}
+);
 
-impl<F> From<F> for {cb_name_uc}
-where
-  F: UnitType
-    + {for_lifetimes_native}FnOnce{call_param_types_native}
-{{
+{target_attr}impl<F: {cb_name_uc}> From<F> for Raw{cb_name_uc} {{
   fn from(_: F) -> Self {{
     #[inline(always)]
-    extern "C" fn adapter<{lifetimes_in_raw_comma}F: Into{cb_name_uc}>{call_params_full_raw} {{
+    extern "C" fn adapter<{lifetimes_in_raw_comma}F: {cb_name_uc}>{call_params_full_raw} {{
       {raw_to_native_conversions}
     }}
 
@@ -2337,10 +2364,9 @@ where
 }}
 "#,
       cb_name_uc = cb_name_uc,
-      for_lifetimes_native = for_lifetimes_native,
+      target_attr = target_attr,
       for_lifetimes_in_raw = for_lifetimes_in_raw,
       lifetimes_in_raw_comma = lifetimes_in_raw_comma,
-      call_param_types_native = call_param_types_native,
       call_param_types_raw = call_param_types_raw,
       call_params_full_raw = call_params_full_raw,
       raw_to_native_conversions = raw_to_native_conversions,
@@ -2349,31 +2375,33 @@ where
     format!(
       r#"
 #[cfg(target_family = "unix")]
-type Raw{cb_name_uc} = {for_lifetimes_in_raw}extern "C" fn{call_param_types_raw};
+#[repr(transparent)]
+pub(crate) struct Raw{cb_name_uc}(
+  {for_lifetimes_in_raw}extern "C" fn{call_param_types_raw}
+);
 
 #[cfg(all(target_family = "windows", target_arch = "x86_64"))]
-type Raw{cb_name_uc} = {for_lifetimes_inout_raw}extern "C" fn{call_param_types_raw_win64fix};
+#[repr(transparent)]
+pub(crate) struct Raw{cb_name_uc}(
+  {for_lifetimes_inout_raw}extern "C" fn{call_param_types_raw_win64fix}
+);
 
-impl<F> From<F> for {cb_name_uc}
-  where
-    F: UnitType
-      + {for_lifetimes_native}FnOnce{call_param_types_native}
-{{
+impl<F: {cb_name_uc}> From<F> for Raw{cb_name_uc} {{
   fn from(_: F) -> Self {{
     #[inline(always)]
-    fn signature_adapter<{lifetimes_in_raw_comma}F: Into{cb_name_uc}>{call_params_full_raw} {{
+    fn signature_adapter<{lifetimes_in_raw_comma}F: {cb_name_uc}>{call_params_full_raw} {{
       {raw_to_native_conversions}
     }}
 
     #[cfg(target_family = "unix")]
     #[inline(always)]
-    extern "C" fn abi_adapter<{lifetimes_in_raw_comma}F: Into{cb_name_uc}>{call_params_full_raw} {{
+    extern "C" fn abi_adapter<{lifetimes_in_raw_comma}F: {cb_name_uc}>{call_params_full_raw} {{
       signature_adapter::<F>{call_param_names_raw}
     }}
 
     #[cfg(all(target_family = "windows", target_arch = "x86_64"))]
     #[inline(always)]
-    extern "C" fn abi_adapter<{lifetimes_inout_raw_comma}F: Into{cb_name_uc}>{call_params_full_raw_win64fix} {{
+    extern "C" fn abi_adapter<{lifetimes_inout_raw_comma}F: {cb_name_uc}>{call_params_full_raw_win64fix} {{
       unsafe {{
         std::ptr::write(return_value, signature_adapter::<F>{call_param_names_raw});
         return_value
@@ -2385,12 +2413,10 @@ impl<F> From<F> for {cb_name_uc}
 }}
 "#,
       cb_name_uc = cb_name_uc,
-      for_lifetimes_native = for_lifetimes_native,
       for_lifetimes_in_raw = for_lifetimes_in_raw,
       for_lifetimes_inout_raw = for_lifetimes_inout_raw,
       lifetimes_in_raw_comma = lifetimes_in_raw_comma,
       lifetimes_inout_raw_comma = lifetimes_inout_raw_comma,
-      call_param_types_native = call_param_types_native,
       call_param_types_raw = call_param_types_raw,
       call_param_types_raw_win64fix = call_param_types_raw_win64fix,
       call_param_names_raw = call_param_names_raw,
@@ -2402,38 +2428,39 @@ impl<F> From<F> for {cb_name_uc}
 
   let test_code = format!(
     r#"
-#[cfg(test)]
+{target_attr}#[cfg(test)]
 fn mock_{cb_name_lc}{lifetimes_native}{call_params_full_native_notused} {{
   unimplemented!()
 }}
 
-#[test]
+{target_attr}#[test]
 fn {cb_name_lc}_as_type_param() {{
-  fn pass_as_type_param<F: Into{cb_name_uc}>(_: F) -> {cb_name_uc} {{
+  fn pass_as_type_param<F: {cb_name_uc}>(_: F) -> Raw{cb_name_uc} {{
     F::get().into()
   }}
   let _ = pass_as_type_param(mock_{cb_name_lc});
 }}
 
-#[test]
-fn {cb_name_lc}_as_impl_into_trait() {{
-  fn pass_as_impl_into_trait(f: impl Into<{cb_name_uc}>) -> {cb_name_uc} {{
+{target_attr}#[test]
+fn {cb_name_lc}_as_impl_trait() {{
+  fn pass_as_impl_trait(f: impl {cb_name_uc}) -> Raw{cb_name_uc} {{
     f.into()
   }}
-  let _ = pass_as_impl_into_trait(mock_{cb_name_lc});
+  let _ = pass_as_impl_trait(mock_{cb_name_lc});
 }}
 
-#[test]
-fn {cb_name_lc}_as_impl_into_macro() {{
-  fn pass_as_impl_into_macro(f: impl_into_{cb_name_lc}!()) -> {cb_name_uc} {{
+{target_attr}#[test]
+fn {cb_name_lc}_as_impl_macro() {{
+  fn pass_as_impl_macro(f: impl_{cb_name_lc}!()) -> Raw{cb_name_uc} {{
     f.into()
   }}
-  let _ = pass_as_impl_into_macro(mock_{cb_name_lc});
-  let _ = pass_as_impl_into_macro({call_param_names_native_closure_notused} unimplemented!());
+  let _ = pass_as_impl_macro(mock_{cb_name_lc});
+  let _ = pass_as_impl_macro({call_param_names_native_closure_notused} unimplemented!());
 }}
 "#,
     cb_name_uc = cb_name_uc,
     cb_name_lc = cb_name_lc,
+    target_attr = target_attr,
     lifetimes_native = lifetimes_native,
     call_param_names_native_closure_notused =
       call_param_names_native_closure_notused,
@@ -2458,7 +2485,9 @@ fn comment_out(code: String) -> String {
     .collect::<String>()
 }
 
-fn get_used_for_comment<'tu>(e: Entity<'tu>) -> String {
+fn get_used_for_comment(_e: Entity) -> String {
+  Default::default()
+  /*
   where_is_type_used(e)
     .into_iter()
     .map(|e| -> Option<String> {
@@ -2475,6 +2504,7 @@ fn get_used_for_comment<'tu>(e: Entity<'tu>) -> String {
     .map(|o| o.unwrap_or_else(|| format!("?? e{:?}", e)))
     .map(|n| format!("/// @@  {}\n", n))
     .collect::<String>()
+    */
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2489,6 +2519,7 @@ fn visit_callback_definition<'tu>(
   fn_ty: Type<'tu>, // The callback function prototype.
 ) -> Result<String, CallbackTranslationError> {
   let cb_name = get_flat_name_for_callback_type(e);
+  //let cb_comment = e.get_parsed_comment().map(|c| format!("{:#?}", c));
   let cb_comment = e.get_comment();
   let ret_ty = fn_ty
     .get_result_type()
@@ -2512,6 +2543,7 @@ fn visit_callback_definition<'tu>(
   if let Some(unk_ty_names) = contains_unknown_cxx_types(&sigs_raw) {
     Err(CallbackTranslationError::UnknownType(unk_ty_names))
   } else {
+    let windows_only = contains_windows_only_types(&sigs_raw);
     Ok(render_callback_definition(
       &cb_name,
       cb_comment.as_deref(),
@@ -2520,6 +2552,7 @@ fn visit_callback_definition<'tu>(
       &sigs_raw,
       used_inputs,
       use_win64fix,
+      windows_only,
     ))
   }
 }
@@ -2635,7 +2668,7 @@ fn boilerplate() -> &'static str {
   r#"
 // Copyright 2019-2020 the Deno authors. All rights reserved. MIT license.
 
-//! # Why these `impl_into_some_callback!()` macros?
+//! # Why these `impl_some_callback!()` macros?
 //!
 //! It appears that Rust is unable to use information that is available from
 //! super traits for type and/or lifetime inference purposes. This causes it to
@@ -2746,6 +2779,10 @@ use crate::Value;
 #[repr(C)] pub struct AtomicsWaitWakeHandle(Opaque);
 #[repr(C)] pub struct JitCodeEvent(Opaque);
 #[repr(C)] pub struct PropertyDescriptor(Opaque);
+
+#[cfg(target_family = "windows")]
+#[repr(C)] pub struct EXCEPTION_POINTERS(Opaque);
+
 #[repr(C)] pub enum  AccessType { _TODO }
 #[repr(C)] pub enum  AtomicsWaitEvent { _TODO }
 #[repr(C)] pub enum  CrashKeyId { _TODO }
