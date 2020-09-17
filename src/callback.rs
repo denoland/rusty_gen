@@ -1,5 +1,58 @@
 #![allow(dead_code)]
 
+// === TODO: special case callbacks ===
+//
+// # Capture - remove by function pointer and data
+//
+// void AddGCPrologueCallback(GCCallbackWithData callback, void* data = nullptr, GCType gc_type_filter = kGCTypeAll);
+// void RemoveGCPrologueCallback(GCCallbackWithData, void* data = nullptr);
+//
+// void AddGCEpilogueCallback(GCCallbackWithData callback, void* data = nullptr, GCType gc_type_filter = kGCTypeAll);
+// void RemoveGCEpilogueCallback(GCCallbackWithData callback, void* data = nullptr);
+//
+// void AddMicrotasksCompletedCallback(MicrotasksCompletedCallbackWithData callback, void* data = nullptr);
+// void RemoveMicrotasksCompletedCallback(MicrotasksCompletedCallbackWithData callback, void* data = nullptr) = 0;
+//
+// # Capture - but remove by ptr only
+//
+// bool AddMessageListener(MessageCallback that, Local<Value> data = Local<Value>());
+// void RemoveMessageListeners(MessageCallback that);
+//
+// void AddNearHeapLimitCallback(NearHeapLimitCallback callback, void* data);
+// void RemoveNearHeapLimitCallback(NearHeapLimitCallback callback, size_t heap_limit);
+//
+// # Capture - remove by overwriting
+//
+// void SetAtomicsWaitCallback(AtomicsWaitCallback callback, void* data);
+//
+// # Capture. Runs once or never
+//
+// void RequestInterrupt(InterruptCallback callback, void* data);
+// void EnqueueMicrotask(MicrotaskCallback callback, void* data = nullptr);
+//
+// # Capture. Runs once, guaranteed.
+//
+// static std::unique_ptr<BackingStore> NewBackingStore(void* data, size_t byte_length, v8::BackingStore::DeleterCallback deleter, void* deleter_data);
+//
+// # Capture but callback is called inline; data can be &mut and need not be 'static.
+// # Wrapped in the C++ variant of a 'Box<dyn>' by V8.
+//
+// void SetDefaultContext(Local<Context> context, SerializeInternalFieldsCallback callback = SerializeInternalFieldsCallback());
+// static Local<Context> New( Isolate* isolate, ExtensionConfiguration* extensions = nullptr, MaybeLocal<ObjectTemplate> global_template = MaybeLocal<ObjectTemplate>(), MaybeLocal<Value> global_object = MaybeLocal<Value>(), DeserializeInternalFieldsCallback internal_fields_deserializer = DeserializeInternalFieldsCallback(), MicrotaskQueue* microtask_queue = nullptr);
+//
+// # No capture, but removable.
+//
+// void AddBeforeCallEnteredCallback(BeforeCallEnteredCallback callback);
+// void RemoveBeforeCallEnteredCallback(BeforeCallEnteredCallback callback);
+//
+// void AddCallCompletedCallback(CallCompletedCallback callback);
+// void RemoveCallCompletedCallback(CallCompletedCallback callback);
+//
+// # No capture. Odd case - user type in return value/param.
+//
+// CreateHistogramCallback create_histogram_callback;
+// AddHistogramSampleCallback add_histogram_sample_callback;
+
 use clang::*;
 use lazy_static::lazy_static;
 use regex::Regex;
