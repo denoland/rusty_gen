@@ -15,8 +15,12 @@ fn main() {
 
   #[allow(clippy::useless_format)]
   let arg = |s| format!("{}", s);
-  let isystem =
-    |suffix| format!("-isystem{}", base_path.join(suffix).to_str().unwrap());
+  let isystem = |suffix| {
+    format!(
+      "-isystem{}",
+      base_path.join(suffix).to_str().unwrap().replace('\\', "/")
+    )
+  };
   let tu = index
     .parser(base_path.join("./v8/include/v8.h"))
     .arguments(&[

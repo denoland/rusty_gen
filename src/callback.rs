@@ -93,6 +93,10 @@ fn type_has_base_class_in_v8_ns(ty: &Type, class_name: &'static str) -> bool {
     .unwrap_or(false)
 }
 
+fn trim_extra_param_suffix<'a, S: AsRef<str> + 'a>(name: &'a S) -> &'a str {
+  name.as_ref().trim_end_matches("WithData")
+}
+
 fn get_flat_name_for_callback_type(e: Entity) -> String {
   let mut name = e.get_name().unwrap();
   let mut parent = e;
@@ -108,12 +112,36 @@ fn get_flat_name_for_callback_type(e: Entity) -> String {
       name = format!("{}{}", parent_name, name);
     }
   }
-  name
+  let name = name
     .replace("CallbackFunction", "Fn")
     .replace("CallbackCallback", "Callback")
-    .replace("CallbackInfoCallback", "Callback")
-    .trim_end_matches("WithData")
-    .to_owned()
+    .replace("CallbackInfoCallback", "Callback");
+  trim_extra_param_suffix(&name).to_owned()
+}
+
+fn get_path_for_fn_or_method(e: Entity) -> String {
+  let mut name = e
+    .get_name()
+    .map(|n| to_snake_case(trim_extra_param_suffix(&n)))
+    .unwrap();
+  let mut parent = e;
+  let mut parent_kind = e.get_kind();
+  loop {
+    parent = parent.get_semantic_parent().unwrap();
+    if is_v8_ns(parent) {
+      break;
+    }
+    let parent_name = match parent.get_name() {
+      Some(n) if !n.is_empty() => trim_extra_param_suffix(&n).to_owned(),
+      _ => continue,
+    };
+    if parent.get_kind() != parent_kind {
+      name = format!("::{}", name);
+      parent_kind = parent.get_kind();
+    }
+    name = format!("{}{}", parent_name, name);
+  }
+  name
 }
 
 fn to_snake_case(s: impl AsRef<str>) -> String {
@@ -211,15 +239,16 @@ fn where_is_type_used<'tu>(e: Entity<'tu>) -> Vec<Entity<'tu>> {
   refs
 }
 
-fn has_sibling_type_with_data(e: Entity) -> bool {
+fn has_sibling_type_with_extra_param(e: Entity) -> bool {
   let name = e.get_name().unwrap();
-  let name_with_data = format!("{}WithData", name);
   let root = e.get_translation_unit().get_entity();
   root.visit_children(|e, _| {
     if Some(e)
       .filter(|e| e.get_typedef_underlying_type().is_some())
       .and_then(|e| e.get_name())
-      .filter(|name2| name2 == &name_with_data)
+      .filter(|name2| {
+        (&name != name2) && (name == trim_extra_param_suffix(name2))
+      })
       .map(|_| true)
       .unwrap_or(false)
     {
@@ -2433,15 +2462,19 @@ fn get_used_for_comment<'tu>(e: Entity<'tu>) -> String {
   where_is_type_used(e)
     .into_iter()
     .map(|e| -> Option<String> {
-      let vn = e.get_display_name()?;
-      let pn = e.get_semantic_parent()?.get_display_name()?;
-      let s = format!("{}::{}", pn, vn);
-      Some(s)
+      Some(match e.get_kind() {
+        EntityKind::ParmDecl => {
+          get_path_for_fn_or_method(e.get_semantic_parent()?)
+        }
+        EntityKind::FieldDecl => {
+          get_path_for_fn_or_method(e.get_semantic_parent()?)
+        }
+        _ => format!("{} {:?}", e.get_display_name()?, e.get_kind()),
+      })
     })
     .map(|o| o.unwrap_or_else(|| format!("?? e{:?}", e)))
     .map(|n| format!("/// @@  {}\n", n))
-    .collect::<String>();
-  Default::default()
+    .collect::<String>()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2501,9 +2534,9 @@ fn visit_declaration<'tu>(
         if let Some(pointee_ty) = ty.get_pointee_type() {
           if pointee_ty.get_kind() == TypeKind::FunctionPrototype {
             let tu = e.get_translation_unit();
-            if has_sibling_type_with_data(e) {
+            if has_sibling_type_with_extra_param(e) {
               eprintln!(
-                "Skipped: `{name}`: because `{name}WithData` exists",
+                "Skipped: `{name}`: because `{name}With«ExtraParam»` exists",
                 name = e.get_name().unwrap_or_default()
               );
             } else if !is_type_used(tu, ty) {
