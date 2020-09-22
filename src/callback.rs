@@ -15,9 +15,6 @@
 //
 // # Capture - but remove by ptr only
 //
-// bool AddMessageListener(MessageCallback that, Local<Value> data = Local<Value>());
-// void RemoveMessageListeners(MessageCallback that);
-//
 // void AddNearHeapLimitCallback(NearHeapLimitCallback callback, void* data);
 // void RemoveNearHeapLimitCallback(NearHeapLimitCallback callback, size_t heap_limit);
 //
