@@ -1838,10 +1838,11 @@ fn give_all_signature_params_a_name(sigs: Vec<Sig>) -> Vec<Sig> {
         id: SigIdent::Param(None),
         ty,
       } => Sig {
-        id: match ty {
+        id: match &ty {
           SigType::Isolate { .. } => "isolate",
           SigType::CallbackInfo { .. } => "info",
           SigType::Void { .. } => "callback_data",
+          SigType::IntPtrSize { .. } => "value",
           _ => "«?»",
         }
         .into(),
@@ -2131,6 +2132,13 @@ fn format_comment(comment: &str) -> String {
   comment.into()
 }
 
+fn format_comment_2(comment: &str) -> String {
+  comment
+    .lines()
+    .map(|l| format!("// {}\n", l))
+    .collect::<String>()
+}
+
 fn render_callback_definition<'tu>(
   cb_name: &str,
   cb_comment: Option<&str>,
@@ -2144,7 +2152,7 @@ fn render_callback_definition<'tu>(
   let cb_name_uc = cb_name;
   let cb_name_lc = to_snake_case(&cb_name);
   let cb_comment_or_separator = cb_comment
-    .map(format_comment)
+    .map(format_comment_2)
     .unwrap_or_else(|| format!("// === {} ===\n", &cb_name_uc));
   let target_attr = if windows_only {
     "#[cfg(target_family = \"windows\")]\n"
@@ -2564,13 +2572,18 @@ enum CallbackTranslationError {
   UnknownType(Vec<String>),
 }
 
+fn dump_comment(e: Entity, depth: usize) -> Option<String> {
+  let c = e.get_parsed_comment()?;
+  Some(format!("{:#?}", c.get_children()))
+}
+
 fn visit_callback_definition<'tu>(
   e: Entity<'tu>,   // The typedef definition node.
   fn_ty: Type<'tu>, // The callback function prototype.
 ) -> Result<String, CallbackTranslationError> {
   let cb_name = get_flat_name_for_callback_type(e);
   //let cb_comment = e.get_parsed_comment().map(|c| format!("{:#?}", c));
-  let cb_comment = e.get_comment();
+  let cb_comment = dump_comment(e, 0);
   let ret_ty = fn_ty
     .get_result_type()
     .ok_or(CallbackTranslationError::GetResultTypeFailed)?;

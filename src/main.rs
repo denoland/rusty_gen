@@ -26,10 +26,12 @@ fn main() {
     .arguments(&[
       arg("-x"),
       arg("c++"),
+      arg("-std=c++17"),
       arg("-nostdinc++"),
       isystem("./buildtools/third_party/libc++/trunk/include"),
       isystem("./buildtools/third_party/libc++abi/trunk/include"),
       arg("-DV8_IMMINENT_DEPRECATION_WARNINGS"),
+      arg("-D_LIBCPP_HAS_NO_VENDOR_AVAILABILITY_ANNOTATIONS"),
     ])
     .parse()
     .unwrap();
