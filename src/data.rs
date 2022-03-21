@@ -455,6 +455,46 @@ fn to_snake_case(s: impl AsRef<str>) -> String {
   words.join("_")
 }
 
+fn get_cast_method<'tu>(
+  e: Entity<'tu>, // Target class, e.g. Boolean.
+  a: Entity<'tu>, // Ancestor class, e.g. Value.
+) -> Option<String> {
+  use EntityKind::*;
+  ["CheckCast", "Cast"]
+    .iter()
+    .find_map(|&name| {
+      e.get_children()
+        .into_iter()
+        .filter(|m| m.get_name().map(|n| &*n == name).unwrap_or(false))
+        .filter(|m| m.get_kind() == Method)
+        .filter(|m| m.is_static_method())
+        .find_map(|m| {
+          let params = m
+            .get_children()
+            .into_iter()
+            .filter(|p| p.get_kind() == ParmDecl)
+            .collect::<Vec<_>>();
+          params
+            .get(0)
+            .filter(|_| params.len() == 1)
+            .and_then(|p| p.get_type())
+            .map(|ty| ty.get_pointee_type().unwrap())
+            .and_then(|ty| ty.get_declaration())
+            .map(|b| b.get_definition().unwrap())
+            .filter(|&b| a == b)
+            .map(|b| {
+              format!(
+                "{}::{}(*{})",
+                e.get_name().unwrap(),
+                m.get_name().unwrap(),
+                b.get_name().unwrap()
+              )
+            })
+        })
+    })
+    .or_else(|| get_cast_method(e, get_single_base_class_or_v8_data(a)?))
+}
+
 fn get_try_from_test_method<'tu>(
   e: Entity<'tu>, // Target class, e.g. Boolean.
   a: Entity<'tu>, // Ancestor class, e.g. Value.
@@ -502,6 +542,7 @@ fn get_try_from_check<'tu>(
         },
       )?
     })
+    .or_else(|| get_cast_method(e, b))
 }
 
 fn add_try_from_impls<'tu>(
@@ -714,7 +755,7 @@ pub fn generate_data_rs(tu: TranslationUnit) {
 
 fn boilerplate() -> &'static str {
   r#"
-// Copyright 2019-2020 the Deno authors. All rights reserved. MIT license.
+// Copyright 2019-2022 the Deno authors. All rights reserved. MIT license.
 
 use std::convert::From;
 use std::convert::TryFrom;
