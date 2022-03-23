@@ -6,4 +6,4 @@ edition = "2018"
 paths = ["deps/clang-rs"]
 
 [dependencies]
-clang = { path = "deps/clang-rs", features = ["clang_12_0"] }
+clang = { version = "1.0.3", features = ["clang_10_0"] }

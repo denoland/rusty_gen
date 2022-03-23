@@ -240,7 +240,7 @@ enum NoSingleBaseClass {
   MoreThanOne,
 }
 
-fn get_single_base_class(e: Entity) -> Result<Entity, NoSingleBaseClass> {
+fn get_single_base_class_base(e: Entity) -> Result<Entity, NoSingleBaseClass> {
   let mut it = e
     .get_children()
     .into_iter()
@@ -255,10 +255,14 @@ fn get_single_base_class(e: Entity) -> Result<Entity, NoSingleBaseClass> {
   }
 }
 
+fn get_single_base_class(e: Entity) -> Option<Entity> {
+  get_single_base_class_base(e).ok()
+}
+
 // Returns the actual base class for `e`, or `v8::Data` if the class has no
 // base class at all.
 fn get_single_base_class_or_v8_data(e: Entity) -> Option<Entity> {
-  match get_single_base_class(e) {
+  match get_single_base_class_base(e) {
     Ok(base) => Some(base),
     Err(NoSingleBaseClass::MoreThanOne) => None,
     Err(NoSingleBaseClass::None) if is_class_in_v8_ns(e, "Data") => None,
@@ -400,6 +404,7 @@ fn add_struct_definition<'tu>(
     writeln!(w, "{}", format_comment(comment))?;
   }
   writeln!(w, "#[repr(C)]")?;
+  writeln!(w, "#[derive(Debug)]")?;
   writeln!(w, "pub struct {}(Opaque);", get_flat_name(class))
 }
 
@@ -422,7 +427,7 @@ fn add_from_impls<'tu>(
   class: Entity<'tu>,
   ancestor: Entity<'tu>,
 ) -> fmt::Result {
-  if let Some(ancestor_base) = get_single_base_class_or_v8_data(ancestor) {
+  if let Some(ancestor_base) = get_single_base_class(ancestor) {
     add_from_impls(defs, class, ancestor_base)?;
   }
   let w = defs.get_class_def(ancestor).from_impl(class);
@@ -455,20 +460,24 @@ fn to_snake_case(s: impl AsRef<str>) -> String {
   words.join("_")
 }
 
+#[allow(dead_code)]
 fn get_cast_method<'tu>(
-  e: Entity<'tu>, // Target class, e.g. Boolean.
-  a: Entity<'tu>, // Ancestor class, e.g. Value.
-) -> Option<String> {
+  target: Entity<'tu>, // Target class, e.g. Boolean.
+  base: Entity<'tu>,   // Ancestor class, e.g. Value.
+) -> Option<(Entity<'tu>, Entity<'tu>)> {
   use EntityKind::*;
   ["CheckCast", "Cast"]
     .iter()
-    .find_map(|&name| {
-      e.get_children()
+    .find_map(|&method_name| {
+      target
+        .get_children()
         .into_iter()
-        .filter(|m| m.get_name().map(|n| &*n == name).unwrap_or(false))
-        .filter(|m| m.get_kind() == Method)
-        .filter(|m| m.is_static_method())
-        .find_map(|m| {
+        .filter(|m| {
+          m.get_name().map(|n| n == method_name).unwrap_or(false)
+            && m.get_kind() == Method
+            && m.is_static_method()
+        })
+        .find(|m| {
           let params = m
             .get_children()
             .into_iter()
@@ -476,32 +485,59 @@ fn get_cast_method<'tu>(
             .collect::<Vec<_>>();
           params
             .get(0)
-            .filter(|_| params.len() == 1)
             .and_then(|p| p.get_type())
-            .map(|ty| ty.get_pointee_type().unwrap())
-            .and_then(|ty| ty.get_declaration())
-            .map(|b| b.get_definition().unwrap())
-            .filter(|&b| a == b)
-            .map(|b| {
-              format!(
-                "{}::{}(*{})",
-                e.get_name().unwrap(),
-                m.get_name().unwrap(),
-                b.get_name().unwrap()
-              )
-            })
+            .and_then(|t| t.get_pointee_type())
+            .and_then(|t| t.get_declaration())
+            .and_then(|b| b.get_definition())
+            .map(|b| b == base)
+            .unwrap_or(false)
+            && params.get(1).is_none()
         })
+        .map(|method| (method, base))
     })
-    .or_else(|| get_cast_method(e, get_single_base_class_or_v8_data(a)?))
+    .or_else(|| get_cast_method(target, get_single_base_class(base)?))
 }
 
-fn get_try_from_test_method<'tu>(
-  e: Entity<'tu>, // Target class, e.g. Boolean.
-  a: Entity<'tu>, // Ancestor class, e.g. Value.
-) -> Option<Entity<'tu>> {
+fn get_custom_is_type_method<'tu>(
+  target: Entity<'tu>, // Target class, e.g. Boolean.
+  _base: Entity<'tu>,  // Ancestor class, e.g. Value.
+) -> Option<String> {
+  let target_name = target.get_name()?;
+  if [
+    "BigInt",
+    "Boolean",
+    "Context",
+    "FixedArray",
+    "FunctionTemplate",
+    "Module",
+    "ModuleRequest",
+    "Name",
+    "Number",
+    "ObjectTemplate",
+    "Primitive",
+    "Private",
+    "String",
+    "Symbol",
+    "Value",
+  ]
+  .iter()
+  .any(|&n| n == &*target_name)
+  {
+    let method_name = format!("Is{}", target_name);
+    Some(method_name)
+  } else {
+    None
+  }
+}
+
+fn get_is_type_method<'tu>(
+  target: Entity<'tu>, // Target class, e.g. Boolean.
+  base: Entity<'tu>,   // Ancestor class, e.g. Value.
+) -> Option<String> {
   use EntityKind::*;
-  let method_name = format!("Is{}", e.get_name()?); // e.g. "IsBoolean".
-  a.get_children()
+  let method_name = format!("Is{}", target.get_name()?); // e.g. "IsBoolean".
+  base
+    .get_children()
     .into_iter()
     .find(|m| {
       m.get_name().map(|n| n == method_name).unwrap_or(false)
@@ -514,35 +550,74 @@ fn get_try_from_test_method<'tu>(
           .into_iter()
           .any(|p| p.get_kind() == ParmDecl)
     })
+    .map(|m| m.get_name().unwrap())
+    .or_else(|| get_is_type_method(target, get_single_base_class(base)?))
+}
+
+fn get_try_from_check_inner<'tu>(
+  target: Entity<'tu>, // Target class, e.g. Boolean.
+  base: Entity<'tu>,   // Base class, e.g. Primitive.
+  var_name: &str,
+  wrap: bool,
+) -> Option<String> {
+  get_custom_is_type_method(target, base)
+    .or_else(|| get_is_type_method(target, base))
+    .map(|method_name| format!("{}.{}()", var_name, to_snake_case(method_name)))
     .or_else(|| {
-      get_try_from_test_method(e, get_single_base_class_or_v8_data(a)?)
+      let subclasses =
+        get_direct_subclasses(target).filter(|list| list.len() > 1)?;
+      let expr = match target.get_name()?.as_str() {
+        // Special case: 'null' and 'undefined' don't have a class of their
+        // own but they are primitive nonetheless.
+        "Primitive" => match base.get_name()?.as_str() {
+          "Value" => format!("{}.is_null_or_undefined()", var_name),
+          _ => return None,
+        },
+        _ => Default::default(),
+      };
+      subclasses
+        .into_iter()
+        .try_fold(expr, |mut expr0, subclass| {
+          let expr1 =
+            get_try_from_check_inner(subclass, base, var_name, false)?;
+          if !expr0.is_empty() {
+            expr0.push_str(" || ");
+          }
+          expr0.push_str(&expr1);
+          Some(expr0)
+        })
+        .map(|mut expr| {
+          if wrap {
+            expr = format!("({})", expr);
+          }
+          expr
+        })
     })
 }
 
 fn get_try_from_check<'tu>(
-  e: Entity<'tu>, // Target class, e.g. Boolean.
-  b: Entity<'tu>, // Base class, e.g. Primitive.
+  target: Entity<'tu>, // Target class, e.g. Boolean.
+  base: Entity<'tu>,   // Base class, e.g. Primitive.
+  var_name: &str,
+  wrap: bool,
 ) -> Option<String> {
-  get_try_from_test_method(e, b)
-    .and_then(|m| Some(format!("v.{}()", to_snake_case(m.get_name()?))))
-    .or_else(|| {
-      get_direct_subclasses(e)?.into_iter().try_fold(
-        match e.get_name()?.as_str() {
-          // Special case: 'null' and 'undefined' don't have a class of their
-          // own but they are primitive nonetheless.
-          "Primitive" => Some("v.is_null_or_undefined()".to_owned()),
-          _ => None,
-        },
-        |check, s| {
-          Some(Some(format!(
-            "{}{}",
-            check.map(|s| format!("{} || ", s)).unwrap_or_default(),
-            get_try_from_check(s, b)?
-          )))
-        },
-      )?
+  get_try_from_check_inner(target, base, var_name, wrap).or_else(|| {
+    std::iter::successors(Some(target), |&target| {
+      get_single_base_class(target).filter(|&middle| middle != base)
     })
-    .or_else(|| get_cast_method(e, b))
+    .skip(1)
+    .find_map(|middle| {
+      let expr1 = get_try_from_check_inner(middle, base, var_name, true)?;
+      let expr2 = get_try_from_check_inner(
+        target,
+        middle,
+        &format!("cast::<{}>(v)", get_flat_name(middle)),
+        true,
+      )?;
+      let expr = format!("{} && {}", expr1, expr2);
+      Some(expr)
+    })
+  })
 }
 
 fn add_try_from_impls<'tu>(
@@ -550,17 +625,17 @@ fn add_try_from_impls<'tu>(
   class: Entity<'tu>,
   ancestor: Entity<'tu>,
 ) -> fmt::Result {
-  if let Some(check) = get_try_from_check(class, ancestor) {
+  if let Some(expr) = get_try_from_check(class, ancestor, "v", false) {
     let w = defs.get_class_def(class).try_from_impl(ancestor);
     writeln!(
       w,
       "impl_try_from! {{ {} for {} if v => {} }}",
       get_flat_name(ancestor),
       get_flat_name(class),
-      check
+      expr
     )?;
   }
-  if let Some(ancestor_base) = get_single_base_class_or_v8_data(ancestor) {
+  if let Some(ancestor_base) = get_single_base_class(ancestor) {
     add_try_from_impls(defs, class, ancestor_base)?;
   }
   Ok(())
@@ -568,7 +643,7 @@ fn add_try_from_impls<'tu>(
 
 fn is_class_comparable_by_identity(e: Entity) -> bool {
   // A class supports comparison by identity if:
-  //  - EITHER it is any of the following classes:
+  //  - EITHER it is any of the following classes:p
   //      - `v8::Boolean`
   //      - `v8::Symbol`
   //  - OR it is NOT any of the following:
@@ -674,10 +749,38 @@ fn add_partial_eq_impls<'tu>(
       add_partial_eq_impl(defs, ancestor, class, compare_method)?;
     }
   }
-  if let Some(ancestor_base) = get_single_base_class_or_v8_data(ancestor) {
+  if let Some(ancestor_base) = get_single_base_class(ancestor) {
     add_partial_eq_impls(defs, class, ancestor_base)?;
   }
   Ok(())
+}
+
+fn class_has_get_identiy_hash_method(class: Entity) -> bool {
+  use EntityKind::*;
+  class.get_children().into_iter().any(|m| {
+    m.get_name()
+      .map(|n| n == "GetIdentityHash")
+      .unwrap_or(false)
+      && m.get_kind() == Method
+      && !m.is_static_method()
+      && !m.is_virtual_method()
+      && !m
+        .get_children()
+        .into_iter()
+        .any(|p| p.get_kind() == ParmDecl)
+  }) || get_single_base_class(class)
+    .map(class_has_get_identiy_hash_method)
+    .unwrap_or(false)
+}
+
+fn get_hash_method(e: Entity) -> Option<&'static str> {
+  if class_has_get_identiy_hash_method(e) {
+    Some("get_identity_hash")
+  } else if has_base_class_in_v8_ns(e, "Value") {
+    Some("get_hash")
+  } else {
+    None
+  }
 }
 
 fn maybe_add_eq_and_hash_impl<'tu>(
@@ -688,8 +791,16 @@ fn maybe_add_eq_and_hash_impl<'tu>(
     let class_def = defs.get_class_def(class);
     let w_eq = class_def.eq_impl();
     writeln!(w_eq, "impl_eq! {{ for {} }}", get_flat_name(class))?;
+  }
+  if let Some(hash_method) = get_hash_method(class) {
+    let class_def = defs.get_class_def(class);
     let w_hash = class_def.hash_impl();
-    writeln!(w_hash, "impl_hash! {{ for {} }}", get_flat_name(class))?;
+    writeln!(
+      w_hash,
+      "impl_hash! {{ for {} use {} }}",
+      get_flat_name(class),
+      hash_method
+    )?;
   }
   Ok(())
 }
@@ -701,7 +812,7 @@ fn visit_class<'tu>(
   add_struct_definition(defs, class)?;
   maybe_add_eq_and_hash_impl(defs, class)?;
   add_partial_eq_impls(defs, class, class)?;
-  if let Some(base) = get_single_base_class_or_v8_data(class) {
+  if let Some(base) = get_single_base_class(class) {
     add_deref_impl(defs, class, base)?;
     add_from_impls(defs, class, base)?;
     add_try_from_impls(defs, class, base)?;
@@ -757,17 +868,119 @@ fn boilerplate() -> &'static str {
   r#"
 // Copyright 2019-2022 the Deno authors. All rights reserved. MIT license.
 
+use std::any::type_name;
 use std::convert::From;
 use std::convert::TryFrom;
 use std::error::Error;
 use std::fmt;
 use std::fmt::Display;
 use std::fmt::Formatter;
+use std::hash::Hash;
+use std::hash::Hasher;
 use std::mem::transmute;
 use std::ops::Deref;
 
 use crate::support::Opaque;
 use crate::Local;
+
+extern "C" {
+  fn v8__Data__EQ(this: *const Data, other: *const Data) -> bool;
+  fn v8__Data__IsBigInt(this: *const Data) -> bool;
+  fn v8__Data__IsBoolean(this: *const Data) -> bool;
+  fn v8__Data__IsContext(this: *const Data) -> bool;
+  fn v8__Data__IsFixedArray(this: *const Data) -> bool;
+  fn v8__Data__IsFunctionTemplate(this: *const Data) -> bool;
+  fn v8__Data__IsModule(this: *const Data) -> bool;
+  fn v8__Data__IsModuleRequest(this: *const Data) -> bool;
+  fn v8__Data__IsName(this: *const Data) -> bool;
+  fn v8__Data__IsNumber(this: *const Data) -> bool;
+  fn v8__Data__IsObjectTemplate(this: *const Data) -> bool;
+  fn v8__Data__IsPrimitive(this: *const Data) -> bool;
+  fn v8__Data__IsPrivate(this: *const Data) -> bool;
+  fn v8__Data__IsString(this: *const Data) -> bool;
+  fn v8__Data__IsSymbol(this: *const Data) -> bool;
+  fn v8__Data__IsValue(this: *const Data) -> bool;
+
+  fn v8__Value__SameValue(this: *const Value, other: *const Value) -> bool;
+  fn v8__Value__StrictEquals(this: *const Value, other: *const Value) -> bool;
+}
+
+impl Data {
+  /// Returns true if this data is a `BigInt`.
+  pub fn is_big_int(&self) -> bool {
+    unsafe { v8__Data__IsBigInt(self) }
+  }
+
+  /// Returns true if this data is a `Boolean`.
+  pub fn is_boolean(&self) -> bool {
+    unsafe { v8__Data__IsBoolean(self) }
+  }
+
+  /// Returns true if this data is a `Context`.
+  pub fn is_context(&self) -> bool {
+    unsafe { v8__Data__IsContext(self) }
+  }
+
+  /// Returns true if this data is a `FixedArray`.
+  pub fn is_fixed_array(&self) -> bool {
+    unsafe { v8__Data__IsFixedArray(self) }
+  }
+
+  /// Returns true if this data is a `FunctionTemplate`.
+  pub fn is_function_template(&self) -> bool {
+    unsafe { v8__Data__IsFunctionTemplate(self) }
+  }
+
+  /// Returns true if this data is a `Module`.
+  pub fn is_module(&self) -> bool {
+    unsafe { v8__Data__IsModule(self) }
+  }
+
+  /// Returns true if this data is a `ModuleRequest`.
+  pub fn is_module_request(&self) -> bool {
+    unsafe { v8__Data__IsModuleRequest(self) }
+  }
+
+  /// Returns true if this data is a `Name`.
+  pub fn is_name(&self) -> bool {
+    unsafe { v8__Data__IsName(self) }
+  }
+
+  /// Returns true if this data is a `Number`.
+  pub fn is_number(&self) -> bool {
+    unsafe { v8__Data__IsNumber(self) }
+  }
+
+  /// Returns true if this data is a `ObjectTemplate`.
+  pub fn is_object_template(&self) -> bool {
+    unsafe { v8__Data__IsObjectTemplate(self) }
+  }
+
+  /// Returns true if this data is a `Primitive`.
+  pub fn is_primitive(&self) -> bool {
+    unsafe { v8__Data__IsPrimitive(self) }
+  }
+
+  /// Returns true if this data is a `Private`.
+  pub fn is_private(&self) -> bool {
+    unsafe { v8__Data__IsPrivate(self) }
+  }
+
+  /// Returns true if this data is a `String`.
+  pub fn is_string(&self) -> bool {
+    unsafe { v8__Data__IsString(self) }
+  }
+
+  /// Returns true if this data is a `Symbol`.
+  pub fn is_symbol(&self) -> bool {
+    unsafe { v8__Data__IsSymbol(self) }
+  }
+
+  /// Returns true if this data is a `Value`.
+  pub fn is_value(&self) -> bool {
+    unsafe { v8__Data__IsValue(self) }
+  }
+}
 
 macro_rules! impl_deref {
   { $target:ident for $type:ident } => {
@@ -793,11 +1006,15 @@ macro_rules! impl_from {
 macro_rules! impl_try_from {
   { $source:ident for $target:ident if $value:pat => $check:expr } => {
     impl<'s> TryFrom<Local<'s, $source>> for Local<'s, $target> {
-      type Error = TryFromTypeError;
+      type Error = DataError;
       fn try_from(l: Local<'s, $source>) -> Result<Self, Self::Error> {
+        #[allow(dead_code)]
+        fn cast<T>(l: Local<$source>) -> Local<T> {
+          unsafe { transmute(l) }
+        }
         match l {
           $value if $check => Ok(unsafe { transmute(l) }),
-          _ => Err(TryFromTypeError::new(stringify!($target)))
+          _ => Err(DataError::bad_type::<$target, $source>())
         }
       }
     }
@@ -806,14 +1023,18 @@ macro_rules! impl_try_from {
 
 macro_rules! impl_eq {
   { for $type:ident } => {
-    impl<'s> Eq for $type {}
+    impl Eq for $type {}
   };
 }
 
-extern "C" {
-  fn v8__Data__EQ(this: *const Data, other: *const Data) -> bool;
-  fn v8__Value__SameValue(this: *const Value, other: *const Value) -> bool;
-  fn v8__Value__StrictEquals(this: *const Value, other: *const Value) -> bool;
+macro_rules! impl_hash {
+  { for $type:ident use $method:ident } => {
+    impl Hash for $type {
+      fn hash<H: Hasher>(&self, state: &mut H) {
+        self.$method().hash(state)
+      }
+    }
+  };
 }
 
 macro_rules! impl_partial_eq {
@@ -835,6 +1056,7 @@ macro_rules! impl_partial_eq {
       }
     }
   };
+
   { $rhs:ident for $type:ident use same_value_zero } => {
     impl<'s> PartialEq<$rhs> for $type {
       fn eq(&self, other: &$rhs) -> bool {
@@ -852,23 +1074,45 @@ macro_rules! impl_partial_eq {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct TryFromTypeError {
-  expected_type: &'static str,
+pub enum DataError {
+  BadType {
+    actual: &'static str,
+    expected: &'static str,
+  },
+  NoData {
+    expected: &'static str,
+  },
 }
 
-impl TryFromTypeError {
-  fn new(expected_type: &'static str) -> Self {
-    Self { expected_type }
+impl DataError {
+  pub(crate) fn bad_type<E: 'static, A: 'static>() -> Self {
+    Self::BadType {
+      expected: type_name::<E>(),
+      actual: type_name::<A>(),
+    }
+  }
+
+  pub(crate) fn no_data<E: 'static>() -> Self {
+    Self::NoData {
+      expected: type_name::<E>(),
+    }
   }
 }
 
-impl Display for TryFromTypeError {
+impl Display for DataError {
   fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-    write!(f, "{} expected", self.expected_type)
+    match self {
+      Self::BadType { expected, actual } => {
+        write!(f, "expected type `{}`, got `{}`", expected, actual)
+      }
+      Self::NoData { expected } => {
+        write!(f, "expected `Some({})`, found `None`", expected)
+      }
+    }
   }
 }
 
-impl Error for TryFromTypeError {}
+impl Error for DataError {}  
 "#
   .trim()
 }

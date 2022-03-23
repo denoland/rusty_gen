@@ -5,6 +5,8 @@ version = 3
 [[package]]
 name = "clang"
 version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "34c6913be3a1c94f52fb975cdec7ef5a7b69de10a55de66dcbc30d7046b85fa1"
 dependencies = [
  "clang-sys",
  "libc",
